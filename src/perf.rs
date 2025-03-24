@@ -3,13 +3,29 @@ use std::{
     fs::File,
     io::{BufRead, BufReader},
     path::Path,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use color_eyre::eyre::Result;
+use smallvec::SmallVec;
+use stable_vec::StableVec;
 use string_interner::{DefaultStringInterner, DefaultSymbol, StringInterner};
 
-pub struct PerfData {}
+#[derive(Debug)]
+pub struct PerfData {
+    pub faults: Vec<PageFault>,
+    pub objects: StableVec<Object>,
+    pub strings: DefaultStringInterner,
+}
+
+impl PerfData {
+    pub fn object_name(&self, idx: usize) -> &str {
+        let symbol = self.objects[idx].file;
+        self.strings.resolve(symbol).unwrap_or("<unknown>")
+    }
+}
+
+pub const PAGE_SIZE: u64 = 0x1000;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Event {
@@ -26,6 +42,12 @@ pub struct Timestamp {
     nsec: u64,
 }
 
+impl Into<Duration> for Timestamp {
+    fn into(self) -> Duration {
+        Duration::new(self.sec, self.nsec as u32)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MMap {
     file: DefaultSymbol,
@@ -36,21 +58,25 @@ pub struct MMap {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Object {
-    file: DefaultSymbol,
-    maps: usize,
-    faults: usize,
-    biggest_offset: u64,
-    smallest_offset: u64,
+    pub file: DefaultSymbol,
+    pub idx: usize,
+    pub maps: usize,
+    pub faults: usize,
+    pub biggest_offset: u64,
+    pub smallest_offset: u64,
+    pub vis_idx: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct PageFault {
-    obj_idx: usize,
-    offset: u64,
-    was_write: bool,
+    pub obj_idx: usize,
+    pub offset: u64,
+    pub was_write: bool,
+    pub time: Duration,
 }
 
-pub fn parse_perf_data<P: AsRef<Path>>(path: P, target_pid: u64) -> Result<PerfData> {
+pub fn parse_perf_data<P: AsRef<Path>>(path: P) -> Result<PerfData> {
+    tracing::info!("reading file {}", path.as_ref().display());
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut strings = StringInterner::<
@@ -59,9 +85,9 @@ pub fn parse_perf_data<P: AsRef<Path>>(path: P, target_pid: u64) -> Result<PerfD
     >::new();
     let mut events = Vec::new();
     let mut maps = Vec::new();
-    for line in reader.lines() {
-        if let Ok(line) = line {
-            let split = line.split_whitespace().collect::<Vec<_>>();
+    for line in reader.lines().enumerate() {
+        if let Ok(line) = line.1 {
+            let split = line.split_whitespace().collect::<SmallVec<[_; 16]>>();
             let pid = split[0];
             let time = sscanf::sscanf!(split[1], "{u64}.{u64}:")
                 .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
@@ -73,7 +99,7 @@ pub fn parse_perf_data<P: AsRef<Path>>(path: P, target_pid: u64) -> Result<PerfD
                     continue;
                 }
 
-                if pids.0 == pids.1 && pids.0 == target_pid as i64 {
+                if pids.0 == pids.1 && pids.0 != 0 {
                     let addr = sscanf::sscanf!(split[4], "[{u64:x}({u64:x})")
                         .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
                     let offset = sscanf::sscanf!(split[6], "{u64:x}")
@@ -87,7 +113,7 @@ pub fn parse_perf_data<P: AsRef<Path>>(path: P, target_pid: u64) -> Result<PerfD
                     })
                 }
             } else {
-                if u64::from_str_radix(pid, 10)? != target_pid {
+                if u64::from_str_radix(pid, 10)? == 0 {
                     continue;
                 }
                 let addr = u64::from_str_radix(split[3], 16)?;
@@ -111,26 +137,25 @@ pub fn parse_perf_data<P: AsRef<Path>>(path: P, target_pid: u64) -> Result<PerfD
         }
     }
 
-    let mut addrs = HashMap::new();
-    let mut objects = Vec::new();
+    let mut objects = StableVec::new();
+    let mut addrmap = nonoverlapping_interval_tree::NonOverlappingIntervalTree::new();
     let mut objmap = HashMap::new();
     tracing::info!("parsing {} maps", maps.len());
     for map in maps {
-        let objmap_entry = objmap.entry(map.file).or_insert_with(|| {
-            let idx = objects.len();
+        let entry = objmap.entry(map.file).or_insert_with(|| {
+            let idx = objects.next_push_index();
             objects.push(Object {
+                idx,
                 file: map.file,
                 maps: 0,
                 faults: 0,
                 biggest_offset: 0,
                 smallest_offset: u64::MAX,
+                vis_idx: None,
             });
             idx
         });
-        objects[*objmap_entry].maps += 1;
-        for a in (map.addr..(map.addr + map.len)).step_by(0x1000) {
-            addrs.insert(a, (*objmap_entry, map));
-        }
+        addrmap.insert(map.addr..(map.addr + map.len), (*entry, map));
     }
 
     tracing::info!("parsing {} events", events.len());
@@ -138,19 +163,14 @@ pub fn parse_perf_data<P: AsRef<Path>>(path: P, target_pid: u64) -> Result<PerfD
         .into_iter()
         .filter_map(|event| {
             let addr = event.addr & !0xfff;
-            if let Some(info) = addrs.get(&addr) {
+            if let Some(info) = addrmap.get(&addr) {
                 let map_offset = addr.checked_sub(info.1.addr).unwrap();
                 let offset = map_offset + info.1.offset;
-                if offset > 0x1000000 {
-                    println!(
-                        "==> {:x}: {:x} {:x} {:x} {:x}",
-                        offset, map_offset, addr, info.1.addr, info.1.offset
-                    );
-                }
                 Some(PageFault {
                     obj_idx: info.0,
                     offset,
                     was_write: false, //TODO
+                    time: event.time.into(),
                 })
             } else {
                 tracing::warn!("page-fault to untracked address {:x}", event.addr);
@@ -159,9 +179,7 @@ pub fn parse_perf_data<P: AsRef<Path>>(path: P, target_pid: u64) -> Result<PerfD
         })
         .collect::<Vec<_>>();
 
-    for fault in faults {
-        //let name = strings.resolve(objects[fault.obj_idx].file).unwrap();
-        //println!("fault to {} : {:x}", name, fault.offset);
+    for fault in &faults {
         objects[fault.obj_idx].faults += 1;
         objects[fault.obj_idx].biggest_offset =
             objects[fault.obj_idx].biggest_offset.max(fault.offset);
@@ -169,13 +187,30 @@ pub fn parse_perf_data<P: AsRef<Path>>(path: P, target_pid: u64) -> Result<PerfD
             objects[fault.obj_idx].smallest_offset.min(fault.offset);
     }
 
-    for obj in &mut objects {
-        if obj.smallest_offset == u64::MAX {
-            obj.smallest_offset = 0;
+    // Filter objects
+    for idx in 0..objects.num_elements() {
+        let Some(object) = objects.get_mut(idx) else {
+            continue;
+        };
+        if object.faults == 0 {
+            objects.remove(idx);
+            continue;
         }
+        if object.biggest_offset == 0 {
+            object.biggest_offset = PAGE_SIZE;
+        }
+        object.biggest_offset = object.biggest_offset.next_multiple_of(PAGE_SIZE);
+        object.smallest_offset = object
+            .smallest_offset
+            .next_multiple_of(PAGE_SIZE)
+            .saturating_sub(PAGE_SIZE);
     }
 
     println!("==> {:#?}", objects);
 
-    todo!()
+    Ok(PerfData {
+        faults,
+        objects,
+        strings,
+    })
 }

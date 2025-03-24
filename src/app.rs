@@ -1,4 +1,10 @@
-use crate::event::{AppEvent, Event, EventHandler};
+use std::time::Duration;
+
+use crate::{
+    event::{AppEvent, Event, EventHandler},
+    perf::PerfData,
+    ui::Ui,
+};
 use ratatui::{
     DefaultTerminal,
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
@@ -7,32 +13,28 @@ use ratatui::{
 /// Application.
 #[derive(Debug)]
 pub struct App {
-    /// Is the application running?
+    pub paused: bool,
     pub running: bool,
-    /// Counter.
-    pub counter: u8,
-    /// Event handler.
     pub events: EventHandler,
-}
-
-impl Default for App {
-    fn default() -> Self {
-        Self {
-            running: true,
-            counter: 0,
-            events: EventHandler::new(),
-        }
-    }
+    pub ui: Ui,
+    pub perf: PerfData,
 }
 
 impl App {
     /// Constructs a new instance of [`App`].
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(mut perf: PerfData, width: u16, trace_file: impl ToString) -> Self {
+        Self {
+            running: true,
+            paused: true,
+            events: EventHandler::new(),
+            ui: Ui::new(&mut perf, width, trace_file),
+            perf,
+        }
     }
 
     /// Run the application's main loop.
     pub fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
+        terminal.clear();
         while self.running {
             terminal.draw(|frame| frame.render_widget(&self, frame.area()))?;
             self.handle_events()?;
@@ -50,6 +52,7 @@ impl App {
             Event::App(app_event) => match app_event {
                 AppEvent::Increment => self.increment_counter(),
                 AppEvent::Decrement => self.decrement_counter(),
+                AppEvent::TogglePause => self.set_pause(!self.paused),
                 AppEvent::Quit => self.quit(),
             },
         }
@@ -65,6 +68,7 @@ impl App {
             }
             KeyCode::Right => self.events.send(AppEvent::Increment),
             KeyCode::Left => self.events.send(AppEvent::Decrement),
+            KeyCode::Char(' ') => self.events.send(AppEvent::TogglePause),
             // Other handlers you could add here.
             _ => {}
         }
@@ -75,7 +79,18 @@ impl App {
     ///
     /// The tick event is where you can update the state of your application with any logic that
     /// needs to be updated at a fixed frame rate. E.g. polling a server, updating an animation.
-    pub fn tick(&self) {}
+    pub fn tick(&mut self) {
+        if self.paused {
+            return;
+        }
+        let next_time = self.ui.status.cur_time + Duration::from_millis(10);
+        while self.ui.status.cur_time < next_time {
+            self.increment_counter();
+            if self.ui.status.cur_event >= self.ui.status.num_events {
+                break;
+            }
+        }
+    }
 
     /// Set running to false to quit the application.
     pub fn quit(&mut self) {
@@ -83,10 +98,22 @@ impl App {
     }
 
     pub fn increment_counter(&mut self) {
-        self.counter = self.counter.saturating_add(1);
+        if self.ui.status.cur_event >= self.ui.status.num_events {
+            return;
+        }
+        let fault = &self.perf.faults[self.ui.status.cur_event];
+        self.ui.fault_vis.fault(fault, &self.perf);
+        self.ui
+            .status
+            .fault(self.ui.status.cur_event, fault, &self.perf);
+        self.ui.status.cur_time = fault.time;
+        if self.ui.status.cur_event < self.ui.status.num_events {
+            self.ui.status.cur_event += 1;
+        }
     }
 
-    pub fn decrement_counter(&mut self) {
-        self.counter = self.counter.saturating_sub(1);
+    pub fn decrement_counter(&mut self) {}
+    pub fn set_pause(&mut self, pause: bool) {
+        self.paused = pause;
     }
 }
