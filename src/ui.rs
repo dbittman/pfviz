@@ -15,8 +15,9 @@ use smallvec::{SmallVec, smallvec};
 use tracing_subscriber::Layer;
 
 use crate::{
+    Cli,
     app::App,
-    perf::{Object, PAGE_SIZE, PageFault, PerfData},
+    perf::{Event, EventKind, Object, PAGE_SIZE, PerfData},
 };
 
 #[derive(Debug)]
@@ -26,10 +27,10 @@ pub struct Ui {
 }
 
 impl Ui {
-    pub fn new(perf: &mut PerfData, width: u16, trace_file: impl ToString) -> Self {
+    pub fn new(cli: &Cli, perf: &mut PerfData) -> Self {
         Self {
-            fault_vis: FaultVis::new(perf, width),
-            status: Status::new(perf, trace_file),
+            fault_vis: FaultVis::new(cli, perf),
+            status: Status::new(cli, perf),
         }
     }
 }
@@ -53,9 +54,10 @@ impl Widget for &App {
 #[derive(Clone, Copy, Debug)]
 pub struct FaultInfo {
     last_addr: u64,
-    value: u64,
+    value: Option<u64>,
     time: Duration,
     style: Style,
+    has_major: Option<u32>,
 }
 
 impl FaultInfo {
@@ -64,7 +66,8 @@ impl FaultInfo {
             last_addr,
             time,
             style,
-            value: 0,
+            value: None,
+            has_major: None,
         }
     }
 }
@@ -104,18 +107,54 @@ impl FileFaultVis {
         }
     }
 
-    pub fn fault(&mut self, fault: &PageFault, perf: &PerfData) {
-        let pos = (fault.offset - self.start_off) / self.bar_size;
-        if pos as usize >= self.data.len() {
+    pub fn fault(&mut self, fault: &Event, perf: &PerfData) {
+        let pos = ((fault.offset - self.start_off) / self.bar_size) as usize;
+        if pos >= self.data.len() {
             return;
         }
         self.faults += 1;
+
+        let mut has_recent_major = if let Some(count) = &mut self.data[pos].has_major {
+            if *count == 0 {
+                false
+            } else {
+                *count -= 1;
+                true
+            }
+        } else {
+            false
+        };
+
+        if fault.kind == EventKind::MajorFault {
+            self.data[pos].has_major = Some(100);
+            has_recent_major = true;
+        }
+
+        if !has_recent_major {
+            self.data[pos].has_major = None;
+        }
+
+        let colors = if fault.kind == EventKind::MajorFault {
+            (Color::LightRed, Color::Red)
+        } else if has_recent_major {
+            (Color::LightMagenta, Color::Magenta)
+        } else {
+            (Color::LightBlue, Color::Blue)
+        };
+
         self.data[pos as usize] = FaultInfo::new(
             fault.offset,
             fault.time,
-            Style::default().bg(Color::LightYellow),
+            Style::default().fg(colors.0).bg(colors.1),
         );
-        self.data[pos as usize].value = 1;
+        for i in 0..self.data.len() {
+            if i != pos as usize {
+                if self.data[i].value == Some(1) {
+                    self.data[i].value = Some(0);
+                }
+            }
+        }
+        self.data[pos as usize].value = Some(1);
     }
 }
 
@@ -154,9 +193,12 @@ pub struct FaultVis {
 }
 
 impl FaultVis {
-    pub fn new(perf: &mut PerfData, width: u16) -> Self {
+    pub fn new(cli: &Cli, perf: &mut PerfData) -> Self {
         let mut file_vis = Vec::new();
         for object in &mut perf.objects {
+            if cli.cutoff > object.1.faults {
+                continue;
+            }
             let mut name = perf.strings.resolve(object.1.file).unwrap().to_string();
             let start = object
                 .1
@@ -164,20 +206,24 @@ impl FaultVis {
                 .next_multiple_of(PAGE_SIZE)
                 .saturating_sub(PAGE_SIZE);
             let end = object.1.biggest_offset.next_multiple_of(PAGE_SIZE);
-            let bar_size = ((end - start) / width as u64)
+            let bar_size = ((end - start) / cli.width as u64)
                 .max(PAGE_SIZE)
                 .next_multiple_of(PAGE_SIZE);
-            if name.len() > width as usize - 8 {
-                let cut = (width as usize - 8).saturating_sub(name.len());
+            if name.len() > cli.width - 8 {
+                name = spat::shorten(name).to_string_lossy().to_string();
+                let cut = name.len().saturating_sub(cli.width - 8);
                 name = "...".to_string() + &name[cut..name.len()];
             }
             object.1.vis_idx = Some(file_vis.len());
             file_vis.push(FileFaultVis::new(name, start, end, bar_size, object.1.idx));
         }
-        Self { file_vis, width }
+        Self {
+            file_vis,
+            width: cli.width as u16,
+        }
     }
 
-    pub fn fault(&mut self, fault: &PageFault, perf: &PerfData) {
+    pub fn fault(&mut self, fault: &Event, perf: &PerfData) {
         let obj = &perf.objects[fault.obj_idx];
         let Some(idx) = obj.vis_idx else {
             return;
@@ -233,7 +279,7 @@ pub struct Status {
 }
 
 impl Status {
-    pub fn new(perf: &PerfData, trace_file: impl ToString) -> Self {
+    pub fn new(cli: &Cli, perf: &PerfData) -> Self {
         let end_time = perf
             .faults
             .iter()
@@ -244,16 +290,17 @@ impl Status {
             cur_event: 0,
             end_time,
             cur_time: Duration::ZERO,
-            trace_file: trace_file.to_string(),
+            trace_file: cli.trace_file.to_string_lossy().to_string(),
             log: Vec::new(),
         }
     }
 
-    pub fn fault(&mut self, idx: usize, fault: &PageFault, perf: &PerfData) {
+    pub fn fault(&mut self, idx: usize, fault: &Event, perf: &PerfData) {
         let off = humansize::format_size(fault.offset, humansize::BINARY);
         let s = format!(
-            "{:10}: fault to {} within {}",
+            "{:10}: {} to {} within {}",
             idx,
+            fault.kind.to_string(),
             off,
             perf.object_name(fault.obj_idx)
         );

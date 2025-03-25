@@ -21,3 +21,5 @@ stable-vec = "0.4.1"
 itertools = "0.14.0"
 interval_tree = "0.2.0"
 nonoverlapping_interval_tree = "0.1.5"
+spat = { version = "0.2.3", default-features = false }
+clap = { version = "4.5.32", features = ["derive"] }

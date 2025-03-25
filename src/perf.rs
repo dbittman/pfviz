@@ -11,9 +11,27 @@ use smallvec::SmallVec;
 use stable_vec::StableVec;
 use string_interner::{DefaultStringInterner, DefaultSymbol, StringInterner};
 
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Ord, Eq)]
+pub enum EventKind {
+    MajorFault,
+    MinorFault,
+    CacheMiss,
+}
+
+impl ToString for EventKind {
+    fn to_string(&self) -> String {
+        match self {
+            EventKind::MajorFault => "major-fault",
+            EventKind::MinorFault => "minor-fault",
+            EventKind::CacheMiss => "cache-miss",
+        }
+        .to_string()
+    }
+}
+
 #[derive(Debug)]
 pub struct PerfData {
-    pub faults: Vec<PageFault>,
+    pub faults: Vec<Event>,
     pub objects: StableVec<Object>,
     pub strings: DefaultStringInterner,
 }
@@ -28,7 +46,7 @@ impl PerfData {
 pub const PAGE_SIZE: u64 = 0x1000;
 
 #[derive(Debug, Clone, Copy)]
-pub struct Event {
+pub struct PerfEvent {
     name: DefaultSymbol,
     sym: DefaultSymbol,
     addr: u64,
@@ -68,11 +86,12 @@ pub struct Object {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct PageFault {
+pub struct Event {
     pub obj_idx: usize,
     pub offset: u64,
     pub was_write: bool,
     pub time: Duration,
+    pub kind: EventKind,
 }
 
 pub fn parse_perf_data<P: AsRef<Path>>(path: P) -> Result<PerfData> {
@@ -89,8 +108,13 @@ pub fn parse_perf_data<P: AsRef<Path>>(path: P) -> Result<PerfData> {
         if let Ok(line) = line.1 {
             let split = line.split_whitespace().collect::<SmallVec<[_; 16]>>();
             let pid = split[0];
-            let time = sscanf::sscanf!(split[1], "{u64}.{u64}:")
-                .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
+            let timesplit = split[1].split(".").collect::<SmallVec<[_; 2]>>();
+            let time = (
+                u64::from_str_radix(timesplit[0], 10)?,
+                u64::from_str_radix(&timesplit[1][..(timesplit[1].len() - 1)], 10)?,
+            );
+            //  let time = sscanf::sscanf!(split[1], "{u64}.{u64}:")
+            //     .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
             let name = split[2];
             if name == "PERF_RECORD_MMAP" || name == "PERF_RECORD_MMAP2" {
                 let pids = sscanf::sscanf!(split[3], "{i64}/{i64}:")
@@ -117,13 +141,17 @@ pub fn parse_perf_data<P: AsRef<Path>>(path: P) -> Result<PerfData> {
                     continue;
                 }
                 let addr = u64::from_str_radix(split[3], 16)?;
+                if addr == 0 {
+                    continue;
+                }
                 let sym = split[4];
-                let ip = u64::from_str_radix(split[5], 16)?;
+                let ip = u64::from_str_radix(split[5], 16)
+                    .inspect_err(|_| tracing::warn!("invalid line: {}", line))?;
 
                 let name = strings.get_or_intern(name);
                 let sym = strings.get_or_intern(sym);
 
-                events.push(Event {
+                events.push(PerfEvent {
                     name,
                     sym,
                     addr,
@@ -164,16 +192,32 @@ pub fn parse_perf_data<P: AsRef<Path>>(path: P) -> Result<PerfData> {
         .filter_map(|event| {
             let addr = event.addr & !0xfff;
             if let Some(info) = addrmap.get(&addr) {
-                let map_offset = addr.checked_sub(info.1.addr).unwrap();
-                let offset = map_offset + info.1.offset;
-                Some(PageFault {
-                    obj_idx: info.0,
-                    offset,
-                    was_write: false, //TODO
-                    time: event.time.into(),
-                })
+                if addr != 0 {
+                    let map_offset = addr.checked_sub(info.1.addr).unwrap();
+                    let offset = map_offset + info.1.offset;
+                    strings.resolve(event.name).and_then(|event_name| {
+                        let kind = if event_name.starts_with("minor-faults") {
+                            Some(EventKind::MinorFault)
+                        } else if event_name.starts_with("major-faults") {
+                            Some(EventKind::MajorFault)
+                        } else if event_name.starts_with("cache-misses") {
+                            Some(EventKind::CacheMiss)
+                        } else {
+                            None
+                        };
+                        kind.map(|kind| Event {
+                            obj_idx: info.0,
+                            offset,
+                            was_write: false, //TODO
+                            time: event.time.into(),
+                            kind,
+                        })
+                    })
+                } else {
+                    None
+                }
             } else {
-                tracing::warn!("page-fault to untracked address {:x}", event.addr);
+                //tracing::warn!("page-fault to untracked address {:x}", event.addr);
                 None
             }
         })
@@ -206,7 +250,11 @@ pub fn parse_perf_data<P: AsRef<Path>>(path: P) -> Result<PerfData> {
             .saturating_sub(PAGE_SIZE);
     }
 
-    println!("==> {:#?}", objects);
+    tracing::info!(
+        "parsing complete: {} events, {} objects",
+        faults.len(),
+        objects.num_elements()
+    );
 
     Ok(PerfData {
         faults,

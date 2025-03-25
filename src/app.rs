@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use crate::{
-    event::{AppEvent, Event, EventHandler},
+    Cli,
+    event::{AppEvent, Event, EventHandler, TICK_FPS},
     perf::PerfData,
     ui::Ui,
 };
@@ -18,17 +19,19 @@ pub struct App {
     pub events: EventHandler,
     pub ui: Ui,
     pub perf: PerfData,
+    pub cli: Cli,
 }
 
 impl App {
     /// Constructs a new instance of [`App`].
-    pub fn new(mut perf: PerfData, width: u16, trace_file: impl ToString) -> Self {
+    pub fn new(cli: Cli, mut perf: PerfData) -> Self {
         Self {
             running: true,
             paused: true,
             events: EventHandler::new(),
-            ui: Ui::new(&mut perf, width, trace_file),
+            ui: Ui::new(&cli, &mut perf),
             perf,
+            cli,
         }
     }
 
@@ -83,11 +86,48 @@ impl App {
         if self.paused {
             return;
         }
-        let next_time = self.ui.status.cur_time + Duration::from_millis(10);
-        while self.ui.status.cur_time < next_time {
-            self.increment_counter();
-            if self.ui.status.cur_event >= self.ui.status.num_events {
-                break;
+        match self.cli.play_mode {
+            crate::PlaybackMode::FrameTime => {
+                let dt = 1.0 / TICK_FPS;
+                let dt = Duration::from_secs_f64(self.cli.play_speed as f64);
+                let next_time = self.ui.status.cur_time + dt;
+                while self.ui.status.cur_time < next_time {
+                    self.increment_counter();
+                    if self.ui.status.cur_event >= self.ui.status.num_events {
+                        break;
+                    }
+                }
+            }
+            crate::PlaybackMode::FrameStep => {
+                let mut i = 0;
+                loop {
+                    self.increment_counter();
+                    i += 1;
+                    if i as f32 > self.cli.play_speed {
+                        break;
+                    }
+                    if self.ui.status.cur_event >= self.ui.status.num_events {
+                        break;
+                    }
+                }
+            }
+            crate::PlaybackMode::Realtime => {
+                let dt = 1.0 / TICK_FPS;
+                let dt = Duration::from_secs_f64(dt * self.cli.play_speed as f64);
+                let next_time = self.ui.status.cur_time + dt;
+                while self.ui.status.cur_time < next_time {
+                    let Some(dur) = self.next_event_time() else {
+                        break;
+                    };
+                    if dur > next_time {
+                        self.ui.status.cur_time = next_time;
+                        break;
+                    }
+                    self.increment_counter();
+                    if self.ui.status.cur_event >= self.ui.status.num_events {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -95,6 +135,14 @@ impl App {
     /// Set running to false to quit the application.
     pub fn quit(&mut self) {
         self.running = false;
+    }
+
+    pub fn next_event_time(&self) -> Option<Duration> {
+        if self.ui.status.cur_event >= self.ui.status.num_events {
+            return None;
+        }
+        let fault = &self.perf.faults[self.ui.status.cur_event];
+        Some(fault.time)
     }
 
     pub fn increment_counter(&mut self) {

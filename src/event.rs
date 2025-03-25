@@ -7,7 +7,7 @@ use std::{
 };
 
 /// The frequency at which tick events are emitted.
-const TICK_FPS: f64 = 30.0;
+pub const TICK_FPS: f64 = 30.0;
 
 /// Representation of all possible events.
 #[derive(Clone, Debug)]
