@@ -49,6 +49,7 @@ pub fn trace(cli: &TraceCli) -> Result<()> {
         .arg("time,event,addr,sym,ip,cpu,tid")
         .arg("--show-mmap-events")
         .arg("--reltime")
+        .arg("--no-demangle")
         .arg("--ns");
 
     command.stdout(Stdio::piped());

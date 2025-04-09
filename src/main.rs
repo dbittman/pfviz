@@ -91,6 +91,8 @@ fn main() -> color_eyre::Result<()> {
 
     let cli = Cli::parse();
 
+    ctrlc::set_handler(|| {}).unwrap();
+
     let result = match cli.sub_cmd {
         SubCmd::Play(play_cli) => {
             let file = File::open(&play_cli.trace_file)?;

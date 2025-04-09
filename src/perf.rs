@@ -163,7 +163,7 @@ pub fn parse_perf_data<Io: Read>(reader: BufReader<Io>) -> Result<PerfData> {
                 let mut addr_sym = split[5];
                 let ip_nr = if split.len() == 7 {
                     5
-                } else if split.len() == 8 {
+                } else if split.len() >= 8 {
                     6
                 } else {
                     bail!("invalid line: {}", line);
