@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use crate::{
-    Cli,
+    PlayCli,
     event::{AppEvent, Event, EventHandler, TICK_FPS},
     perf::PerfData,
     ui::Ui,
@@ -19,12 +19,12 @@ pub struct App {
     pub events: EventHandler,
     pub ui: Ui,
     pub perf: PerfData,
-    pub cli: Cli,
+    pub cli: PlayCli,
 }
 
 impl App {
     /// Constructs a new instance of [`App`].
-    pub fn new(cli: Cli, mut perf: PerfData) -> Self {
+    pub fn new(cli: PlayCli, mut perf: PerfData) -> Self {
         Self {
             running: true,
             paused: true,
@@ -88,7 +88,6 @@ impl App {
         }
         match self.cli.play_mode {
             crate::PlaybackMode::FrameTime => {
-                let dt = 1.0 / TICK_FPS;
                 let dt = Duration::from_secs_f64(self.cli.play_speed as f64);
                 let next_time = self.ui.status.cur_time + dt;
                 while self.ui.status.cur_time < next_time {

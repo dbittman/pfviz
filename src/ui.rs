@@ -15,7 +15,7 @@ use smallvec::{SmallVec, smallvec};
 use tracing_subscriber::Layer;
 
 use crate::{
-    Cli,
+    PlayCli,
     app::App,
     perf::{Event, EventKind, Object, PAGE_SIZE, PerfData},
 };
@@ -27,7 +27,7 @@ pub struct Ui {
 }
 
 impl Ui {
-    pub fn new(cli: &Cli, perf: &mut PerfData) -> Self {
+    pub fn new(cli: &PlayCli, perf: &mut PerfData) -> Self {
         Self {
             fault_vis: FaultVis::new(cli, perf),
             status: Status::new(cli, perf),
@@ -193,7 +193,7 @@ pub struct FaultVis {
 }
 
 impl FaultVis {
-    pub fn new(cli: &Cli, perf: &mut PerfData) -> Self {
+    pub fn new(cli: &PlayCli, perf: &mut PerfData) -> Self {
         let mut file_vis = Vec::new();
         for object in &mut perf.objects {
             if cli.cutoff > object.1.faults {
@@ -279,7 +279,7 @@ pub struct Status {
 }
 
 impl Status {
-    pub fn new(cli: &Cli, perf: &PerfData) -> Self {
+    pub fn new(cli: &PlayCli, perf: &PerfData) -> Self {
         let end_time = perf
             .faults
             .iter()

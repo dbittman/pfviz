@@ -1,21 +1,31 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fs::File,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, BufWriter, Read, Write},
     path::Path,
     time::{Duration, Instant},
 };
 
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, bail};
 use smallvec::SmallVec;
 use stable_vec::StableVec;
-use string_interner::{DefaultStringInterner, DefaultSymbol, StringInterner};
+use string_interner::{DefaultStringInterner, DefaultSymbol, StringInterner, Symbol};
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Ord, Eq)]
 pub enum EventKind {
     MajorFault,
     MinorFault,
     CacheMiss,
+}
+
+impl Into<u32> for EventKind {
+    fn into(self) -> u32 {
+        match self {
+            EventKind::MajorFault => 1,
+            EventKind::MinorFault => 2,
+            EventKind::CacheMiss => 3,
+        }
+    }
 }
 
 impl ToString for EventKind {
@@ -49,9 +59,11 @@ pub const PAGE_SIZE: u64 = 0x1000;
 pub struct PerfEvent {
     name: DefaultSymbol,
     sym: DefaultSymbol,
+    addr_sym: DefaultSymbol,
     addr: u64,
     ip: u64,
     time: Timestamp,
+    tid: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -92,12 +104,13 @@ pub struct Event {
     pub was_write: bool,
     pub time: Duration,
     pub kind: EventKind,
+    pub event_name: DefaultSymbol,
+    pub addr: u64,
+    pub ip: u64,
+    pub tid: u32,
 }
 
-pub fn parse_perf_data<P: AsRef<Path>>(path: P) -> Result<PerfData> {
-    tracing::info!("reading file {}", path.as_ref().display());
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
+pub fn parse_perf_data<Io: Read>(reader: BufReader<Io>) -> Result<PerfData> {
     let mut strings = StringInterner::<
         string_interner::DefaultBackend,
         string_interner::DefaultHashBuilder,
@@ -107,27 +120,32 @@ pub fn parse_perf_data<P: AsRef<Path>>(path: P) -> Result<PerfData> {
     for line in reader.lines().enumerate() {
         if let Ok(line) = line.1 {
             let split = line.split_whitespace().collect::<SmallVec<[_; 16]>>();
-            let pid = split[0];
-            let timesplit = split[1].split(".").collect::<SmallVec<[_; 2]>>();
+            let tid = split[0];
+            let tid = u32::from_str_radix(tid, 10)?;
+            if tid == 0 {
+                continue;
+            }
+            let _cpu = split[1];
+            let timesplit = split[2].split(".").collect::<SmallVec<[_; 2]>>();
             let time = (
                 u64::from_str_radix(timesplit[0], 10)?,
                 u64::from_str_radix(&timesplit[1][..(timesplit[1].len() - 1)], 10)?,
             );
-            //  let time = sscanf::sscanf!(split[1], "{u64}.{u64}:")
-            //     .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
-            let name = split[2];
+            let name = split[3];
             if name == "PERF_RECORD_MMAP" || name == "PERF_RECORD_MMAP2" {
-                let pids = sscanf::sscanf!(split[3], "{i64}/{i64}:")
+                let pids = sscanf::sscanf!(split[4], "{i64}/{i64}:")
                     .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
                 if pids.0 < 0 || pids.1 < 0 {
                     continue;
                 }
 
-                if pids.0 == pids.1 && pids.0 != 0 {
-                    let addr = sscanf::sscanf!(split[4], "[{u64:x}({u64:x})")
-                        .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
-                    let offset = sscanf::sscanf!(split[6], "{u64:x}")
-                        .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
+                if pids.0 != 0 && pids.0 != 0 {
+                    let addr = sscanf::sscanf!(split[5], "[{u64:x}({u64:x})")
+                        .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))
+                        .inspect_err(|_| tracing::warn!("invalid line: {}", line))?;
+                    let offset = sscanf::sscanf!(split[7], "{u64:x}")
+                        .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))
+                        .inspect_err(|_| tracing::warn!("invalid line: {}", line))?;
                     let mapfile = split[11];
                     maps.push(MMap {
                         file: strings.get_or_intern(mapfile),
@@ -137,28 +155,41 @@ pub fn parse_perf_data<P: AsRef<Path>>(path: P) -> Result<PerfData> {
                     })
                 }
             } else {
-                if u64::from_str_radix(pid, 10)? == 0 {
-                    continue;
-                }
-                let addr = u64::from_str_radix(split[3], 16)?;
+                let addr = u64::from_str_radix(split[4], 16)?;
                 if addr == 0 {
                     continue;
                 }
-                let sym = split[4];
-                let ip = u64::from_str_radix(split[5], 16)
+                let sym = split.get(7).unwrap_or(&"[unknown]");
+                let mut addr_sym = split[5];
+                let ip_nr = if split.len() == 7 {
+                    5
+                } else if split.len() == 8 {
+                    6
+                } else {
+                    bail!("invalid line: {}", line);
+                };
+                let ip = u64::from_str_radix(split[ip_nr], 16)
                     .inspect_err(|_| tracing::warn!("invalid line: {}", line))?;
+
+                if u64::from_str_radix(addr_sym, 16).is_ok() {
+                    // Probably means the symbol wasn't printed.
+                    addr_sym = "[unknown]";
+                }
 
                 let name = strings.get_or_intern(name);
                 let sym = strings.get_or_intern(sym);
+                let addr_sym = strings.get_or_intern(addr_sym);
 
                 events.push(PerfEvent {
                     name,
                     sym,
+                    addr_sym,
                     addr,
                     ip,
+                    tid,
                     time: Timestamp {
                         sec: time.0,
-                        nsec: time.1 * 1000,
+                        nsec: time.1,
                     },
                 });
             }
@@ -193,7 +224,7 @@ pub fn parse_perf_data<P: AsRef<Path>>(path: P) -> Result<PerfData> {
             let addr = event.addr & !0xfff;
             if let Some(info) = addrmap.get(&addr) {
                 if addr != 0 {
-                    let map_offset = addr.checked_sub(info.1.addr).unwrap();
+                    let map_offset = event.addr.checked_sub(info.1.addr).unwrap();
                     let offset = map_offset + info.1.offset;
                     strings.resolve(event.name).and_then(|event_name| {
                         let kind = if event_name.starts_with("minor-faults") {
@@ -211,6 +242,10 @@ pub fn parse_perf_data<P: AsRef<Path>>(path: P) -> Result<PerfData> {
                             was_write: false, //TODO
                             time: event.time.into(),
                             kind,
+                            event_name: event.name,
+                            addr: event.addr,
+                            ip: event.ip,
+                            tid: event.tid,
                         })
                     })
                 } else {
@@ -261,4 +296,55 @@ pub fn parse_perf_data<P: AsRef<Path>>(path: P) -> Result<PerfData> {
         objects,
         strings,
     })
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, bytemuck::Pod, bytemuck::Zeroable)]
+struct EventRecord {
+    addr: u64,
+    ip: u64,
+    offset: u64,
+    time_ns: u64,
+    _resv: u64,
+    kind: u32,
+    flags: u32,
+    event_name: u32,
+    file_name: u32,
+    tid: u32,
+    cpu: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, bytemuck::Pod, bytemuck::Zeroable)]
+struct RecordHeader {
+    magic: u64,
+    _resv: [u64; 7],
+}
+
+pub fn write_perf_data<W: Write>(pd: &PerfData, mut out: BufWriter<W>) -> Result<()> {
+    out.write(bytemuck::bytes_of(&RecordHeader {
+        magic: 0xAAAA1111CAFED00D,
+        _resv: [0; 7],
+    }))?;
+    for ev in &pd.faults {
+        let obj = &pd.objects[ev.obj_idx];
+
+        let record = EventRecord {
+            addr: ev.addr,
+            ip: ev.ip,
+            offset: ev.offset,
+            time_ns: ev.time.as_nanos() as u64,
+            kind: ev.kind.into(),
+            flags: 0,
+            event_name: ev.event_name.to_usize() as u32,
+            file_name: obj.file.to_usize() as u32,
+            tid: ev.tid,
+            cpu: 0,
+            _resv: 0,
+        };
+
+        out.write(bytemuck::bytes_of(&record))?;
+    }
+    out.flush()?;
+    Ok(())
 }

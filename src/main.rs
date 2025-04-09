@@ -1,4 +1,4 @@
-use std::{path::PathBuf, str::FromStr};
+use std::{fs::File, io::BufReader, path::PathBuf, str::FromStr};
 
 use crate::app::App;
 use clap::{Parser, Subcommand};
@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 pub mod app;
 pub mod event;
 pub mod perf;
+pub mod trace;
 pub mod ui;
 
 #[derive(Parser, Clone, Copy, Debug, clap::ValueEnum)]
@@ -27,7 +28,7 @@ impl ToString for PlaybackMode {
 }
 
 #[derive(Parser, Clone, Debug)]
-struct Cli {
+struct PlayCli {
     #[arg(value_name = "FILE", help = "Path of trace file to use")]
     trace_file: PathBuf,
     #[arg(
@@ -50,6 +51,38 @@ struct Cli {
     play_speed: f32,
 }
 
+#[derive(Parser, Clone, Debug)]
+struct TraceCli {
+    #[arg(short, long, value_name = "FILE", help = "Path of trace file to use")]
+    output: Option<PathBuf>,
+    #[arg(
+        short,
+        long = "event",
+        value_name = "EVENT",
+        help = "Perf event to trace, can be specified multiple times"
+    )]
+    events: Vec<String>,
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "COMMAND",
+        help = "Command to trace"
+    )]
+    command: Vec<String>,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum SubCmd {
+    Play(PlayCli),
+    Trace(TraceCli),
+}
+
+#[derive(Parser, Clone, Debug)]
+struct Cli {
+    #[command(subcommand)]
+    sub_cmd: SubCmd,
+}
+
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
     tracing_subscriber::fmt()
@@ -58,12 +91,18 @@ fn main() -> color_eyre::Result<()> {
 
     let cli = Cli::parse();
 
-    let data = perf::parse_perf_data(&cli.trace_file)?;
+    let result = match cli.sub_cmd {
+        SubCmd::Play(play_cli) => {
+            let file = File::open(&play_cli.trace_file)?;
+            let data = perf::parse_perf_data(BufReader::new(file))?;
+            let terminal = ratatui::init();
+            let app = App::new(play_cli, data);
+            let result = app.run(terminal);
+            ratatui::restore();
+            result
+        }
+        SubCmd::Trace(trace_cli) => trace::trace(&trace_cli),
+    };
 
-    let terminal = ratatui::init();
-    let app = App::new(cli, data);
-    tracing::info!("ready");
-    let result = app.run(terminal);
-    ratatui::restore();
     result
 }
