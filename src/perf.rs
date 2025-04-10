@@ -1,21 +1,35 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     fs::File,
     io::{BufRead, BufReader, BufWriter, Read, Write},
     path::Path,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use color_eyre::eyre::{Result, bail};
+use memmap2::Mmap;
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use stable_vec::StableVec;
 use string_interner::{DefaultStringInterner, DefaultSymbol, StringInterner, Symbol};
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Ord, Eq)]
 pub enum EventKind {
+    Unknown,
     MajorFault,
     MinorFault,
     CacheMiss,
+}
+
+impl EventKind {
+    pub fn is_miss(&self) -> bool {
+        matches!(self, EventKind::CacheMiss) || matches!(self, EventKind::Unknown)
+    }
+
+    pub fn is_fault(&self) -> bool {
+        // maybe will expand in future
+        !self.is_miss()
+    }
 }
 
 impl Into<u32> for EventKind {
@@ -24,6 +38,18 @@ impl Into<u32> for EventKind {
             EventKind::MajorFault => 1,
             EventKind::MinorFault => 2,
             EventKind::CacheMiss => 3,
+            EventKind::Unknown => 0,
+        }
+    }
+}
+
+impl From<u32> for EventKind {
+    fn from(value: u32) -> Self {
+        match value {
+            1 => EventKind::MajorFault,
+            2 => EventKind::MinorFault,
+            3 => EventKind::CacheMiss,
+            _ => EventKind::Unknown,
         }
     }
 }
@@ -34,6 +60,7 @@ impl ToString for EventKind {
             EventKind::MajorFault => "major-fault",
             EventKind::MinorFault => "minor-fault",
             EventKind::CacheMiss => "cache-miss",
+            EventKind::Unknown => "unknown",
         }
         .to_string()
     }
@@ -55,6 +82,7 @@ impl PerfData {
 
 pub const PAGE_SIZE: u64 = 0x1000;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct PerfEvent {
     name: DefaultSymbol,
@@ -86,7 +114,7 @@ pub struct MMap {
     len: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct Object {
     pub file: DefaultSymbol,
     pub idx: usize,
@@ -94,7 +122,7 @@ pub struct Object {
     pub faults: usize,
     pub biggest_offset: u64,
     pub smallest_offset: u64,
-    pub vis_idx: Option<usize>,
+    pub show: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -117,6 +145,7 @@ pub fn parse_perf_data<Io: Read>(reader: BufReader<Io>) -> Result<PerfData> {
     >::new();
     let mut events = Vec::new();
     let mut maps = Vec::new();
+    let mut count = 0;
     for line in reader.lines().enumerate() {
         if let Ok(line) = line.1 {
             let split = line.split_whitespace().collect::<SmallVec<[_; 16]>>();
@@ -124,6 +153,10 @@ pub fn parse_perf_data<Io: Read>(reader: BufReader<Io>) -> Result<PerfData> {
             let tid = u32::from_str_radix(tid, 10)?;
             if tid == 0 {
                 continue;
+            }
+            count += 1;
+            if count % 1000 == 0 {
+                eprint!("event: {count}              \r");
             }
             let _cpu = split[1];
             let timesplit = split[2].split(".").collect::<SmallVec<[_; 2]>>();
@@ -146,7 +179,7 @@ pub fn parse_perf_data<Io: Read>(reader: BufReader<Io>) -> Result<PerfData> {
                     let offset = sscanf::sscanf!(split[7], "{u64:x}")
                         .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))
                         .inspect_err(|_| tracing::warn!("invalid line: {}", line))?;
-                    let mapfile = split[11];
+                    let mapfile = split[12];
                     maps.push(MMap {
                         file: strings.get_or_intern(mapfile),
                         offset,
@@ -201,6 +234,12 @@ pub fn parse_perf_data<Io: Read>(reader: BufReader<Io>) -> Result<PerfData> {
     let mut objmap = HashMap::new();
     tracing::info!("parsing {} maps", maps.len());
     for map in maps {
+        tracing::debug!(
+            "map: {:?} {} {}",
+            strings.resolve(map.file),
+            map.addr,
+            map.len
+        );
         let entry = objmap.entry(map.file).or_insert_with(|| {
             let idx = objects.next_push_index();
             objects.push(Object {
@@ -210,7 +249,7 @@ pub fn parse_perf_data<Io: Read>(reader: BufReader<Io>) -> Result<PerfData> {
                 faults: 0,
                 biggest_offset: 0,
                 smallest_offset: u64::MAX,
-                vis_idx: None,
+                show: true,
             });
             idx
         });
@@ -234,7 +273,7 @@ pub fn parse_perf_data<Io: Read>(reader: BufReader<Io>) -> Result<PerfData> {
                         } else if event_name.starts_with("cache-misses") {
                             Some(EventKind::CacheMiss)
                         } else {
-                            None
+                            Some(EventKind::Unknown)
                         };
                         kind.map(|kind| Event {
                             obj_idx: info.0,
@@ -271,6 +310,11 @@ pub fn parse_perf_data<Io: Read>(reader: BufReader<Io>) -> Result<PerfData> {
         let Some(object) = objects.get_mut(idx) else {
             continue;
         };
+        tracing::debug!(
+            "object: {} {}",
+            strings.resolve(object.file).unwrap_or("[unknown]"),
+            object.faults
+        );
         if object.faults == 0 {
             objects.remove(idx);
             continue;
@@ -300,7 +344,7 @@ pub fn parse_perf_data<Io: Read>(reader: BufReader<Io>) -> Result<PerfData> {
 
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, bytemuck::Pod, bytemuck::Zeroable)]
-struct EventRecord {
+pub struct EventRecord {
     addr: u64,
     ip: u64,
     offset: u64,
@@ -309,26 +353,64 @@ struct EventRecord {
     kind: u32,
     flags: u32,
     event_name: u32,
-    file_name: u32,
+    obj_id: u32,
     tid: u32,
     cpu: u32,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, bytemuck::Pod, bytemuck::Zeroable)]
-struct RecordHeader {
-    magic: u64,
-    _resv: [u64; 7],
+impl EventRecord {
+    pub fn time(&self) -> Duration {
+        Duration::from_nanos(self.time_ns)
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub fn kind(&self) -> EventKind {
+        self.kind.into()
+    }
+
+    pub fn obj_id(&self) -> usize {
+        self.obj_id as usize
+    }
 }
 
-pub fn write_perf_data<W: Write>(pd: &PerfData, mut out: BufWriter<W>) -> Result<()> {
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RecordHeader {
+    magic: u64,
+    count: u64,
+    _resv: [u64; 6],
+}
+
+impl RecordHeader {
+    pub fn record_count(&self) -> usize {
+        self.count as usize
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.magic == 0xAAAA1111CAFED00D
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct JsonRoot {
+    pub objects: HashMap<usize, Object>,
+    pub strings: DefaultStringInterner,
+}
+
+pub fn write_perf_data<W: Write, WJ: Write>(
+    pd: &PerfData,
+    mut out: BufWriter<W>,
+    out_json: BufWriter<WJ>,
+) -> Result<()> {
     out.write(bytemuck::bytes_of(&RecordHeader {
         magic: 0xAAAA1111CAFED00D,
-        _resv: [0; 7],
+        count: pd.faults.len() as u64,
+        _resv: [0; 6],
     }))?;
     for ev in &pd.faults {
-        let obj = &pd.objects[ev.obj_idx];
-
         let record = EventRecord {
             addr: ev.addr,
             ip: ev.ip,
@@ -337,7 +419,7 @@ pub fn write_perf_data<W: Write>(pd: &PerfData, mut out: BufWriter<W>) -> Result
             kind: ev.kind.into(),
             flags: 0,
             event_name: ev.event_name.to_usize() as u32,
-            file_name: obj.file.to_usize() as u32,
+            obj_id: ev.obj_idx as u32,
             tid: ev.tid,
             cpu: 0,
             _resv: 0,
@@ -346,5 +428,75 @@ pub fn write_perf_data<W: Write>(pd: &PerfData, mut out: BufWriter<W>) -> Result
         out.write(bytemuck::bytes_of(&record))?;
     }
     out.flush()?;
+
+    let root = JsonRoot {
+        strings: pd.strings.clone(),
+        objects: pd.objects.iter().map(|x| (x.0, x.1.clone())).collect(),
+    };
+
+    serde_json::to_writer(out_json, &root)?;
     Ok(())
+}
+
+#[derive(Debug)]
+pub struct Records {
+    map: Mmap,
+}
+
+impl Records {
+    fn record_start(&self) -> *const EventRecord {
+        unsafe {
+            self.map
+                .as_ptr()
+                .add(size_of::<RecordHeader>())
+                .cast::<EventRecord>()
+        }
+    }
+
+    pub fn header(&self) -> &RecordHeader {
+        unsafe { self.map.as_ptr().cast::<RecordHeader>().as_ref().unwrap() }
+    }
+
+    pub fn slice(&self) -> &[EventRecord] {
+        unsafe { core::slice::from_raw_parts(self.record_start(), self.header().record_count()) }
+    }
+}
+
+pub fn mmap_records<P: AsRef<Path>>(path: P) -> Result<Records> {
+    let file = File::open(path)?;
+    let recs = unsafe { memmap2::Mmap::map(&file) }.map(|map| Records { map })?;
+    if !recs.header().is_valid() {
+        bail!("invalid header in records file");
+    }
+    Ok(recs)
+}
+
+pub fn open_json_root<P: AsRef<Path>>(path: P) -> Result<JsonRoot> {
+    let file = File::open(path)?;
+    let root = serde_json::from_reader(BufReader::new(file))?;
+    Ok(root)
+}
+
+#[derive(Debug)]
+pub struct FaultData {
+    pub json: JsonRoot,
+    pub records: Records,
+}
+
+impl FaultData {
+    pub fn open<P: AsRef<Path>, P2: AsRef<Path>>(data: P, json: P2) -> Result<Self> {
+        Ok(Self {
+            json: open_json_root(json)?,
+            records: mmap_records(data)?,
+        })
+    }
+
+    pub fn object(&self, fault: &EventRecord) -> &Object {
+        &self.json.objects[&(fault.obj_id as usize)]
+    }
+
+    pub fn object_name(&self, fault: &EventRecord) -> &str {
+        let obj = self.object(fault);
+        self.json.strings.resolve(obj.file).unwrap_or("[unknown]")
+    }
 }

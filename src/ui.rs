@@ -1,36 +1,33 @@
-use std::{
-    char::MAX,
-    io::{Write, stdin, stdout},
-    time::Duration,
-};
+use std::{collections::HashMap, time::Duration};
 
 use itertools::Itertools;
 use ratatui::{
     buffer::Buffer,
-    layout::{Alignment, Constraint, Direction, Flex, Layout, Rect},
-    style::{Color, Style, Stylize},
-    widgets::{Block, BorderType, Borders, Paragraph, Sparkline, SparklineBar, Widget},
+    layout::{Constraint, Direction, Flex, Layout, Rect},
+    style::{Color, Style},
+    widgets::{Block, Borders, Paragraph, Sparkline, SparklineBar, Widget},
 };
-use smallvec::{SmallVec, smallvec};
-use tracing_subscriber::Layer;
 
 use crate::{
     PlayCli,
     app::App,
-    perf::{Event, EventKind, Object, PAGE_SIZE, PerfData},
+    perf::{EventKind, EventRecord, FaultData, PAGE_SIZE},
 };
 
 #[derive(Debug)]
 pub struct Ui {
     pub fault_vis: FaultVis,
     pub status: Status,
+    pub map: HashMap<usize, usize>,
 }
 
 impl Ui {
-    pub fn new(cli: &PlayCli, perf: &mut PerfData) -> Self {
+    pub fn new(cli: &PlayCli, data: &FaultData) -> Self {
+        let mut map = HashMap::new();
         Self {
-            fault_vis: FaultVis::new(cli, perf),
-            status: Status::new(cli, perf),
+            fault_vis: FaultVis::new(cli, data, &mut map),
+            status: Status::new(cli, data),
+            map,
         }
     }
 }
@@ -52,6 +49,7 @@ impl Widget for &App {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 pub struct FaultInfo {
     last_addr: u64,
     value: Option<u64>,
@@ -79,7 +77,6 @@ pub struct FileFaultVis {
     start_off: u64,
     end_off: u64,
     bar_size: u64,
-    obj_idx: usize,
     faults: usize,
 }
 
@@ -90,7 +87,7 @@ impl Into<SparklineBar> for &FaultInfo {
 }
 
 impl FileFaultVis {
-    pub fn new(name: String, start_off: u64, end_off: u64, bar_size: u64, obj_idx: usize) -> Self {
+    pub fn new(name: String, start_off: u64, end_off: u64, bar_size: u64) -> Self {
         let len = ((1 + end_off - start_off) / bar_size) - 1;
         let data = vec![
             FaultInfo::new(0, Duration::ZERO, Style::default().bg(Color::DarkGray));
@@ -98,7 +95,6 @@ impl FileFaultVis {
         ];
         Self {
             faults: 0,
-            obj_idx,
             data,
             name,
             start_off,
@@ -107,8 +103,8 @@ impl FileFaultVis {
         }
     }
 
-    pub fn fault(&mut self, fault: &Event, perf: &PerfData) {
-        let pos = ((fault.offset - self.start_off) / self.bar_size) as usize;
+    pub fn fault(&mut self, fault: &EventRecord, _data: &FaultData) {
+        let pos = ((fault.offset() - self.start_off) / self.bar_size) as usize;
         if pos >= self.data.len() {
             return;
         }
@@ -125,7 +121,7 @@ impl FileFaultVis {
             false
         };
 
-        if fault.kind == EventKind::MajorFault {
+        if fault.kind() == EventKind::MajorFault {
             self.data[pos].has_major = Some(100);
             has_recent_major = true;
         }
@@ -134,7 +130,7 @@ impl FileFaultVis {
             self.data[pos].has_major = None;
         }
 
-        let colors = if fault.kind == EventKind::MajorFault {
+        let mut colors = if fault.kind() == EventKind::MajorFault {
             (Color::LightRed, Color::Red)
         } else if has_recent_major {
             (Color::LightMagenta, Color::Magenta)
@@ -142,9 +138,13 @@ impl FileFaultVis {
             (Color::LightBlue, Color::Blue)
         };
 
+        if fault.kind().is_miss() {
+            colors = (Color::LightGreen, Color::Green);
+        }
+
         self.data[pos as usize] = FaultInfo::new(
-            fault.offset,
-            fault.time,
+            fault.offset(),
+            fault.time(),
             Style::default().fg(colors.0).bg(colors.1),
         );
         for i in 0..self.data.len() {
@@ -193,19 +193,18 @@ pub struct FaultVis {
 }
 
 impl FaultVis {
-    pub fn new(cli: &PlayCli, perf: &mut PerfData) -> Self {
+    pub fn new(cli: &PlayCli, data: &FaultData, map: &mut HashMap<usize, usize>) -> Self {
         let mut file_vis = Vec::new();
-        for object in &mut perf.objects {
-            if cli.cutoff > object.1.faults {
+        for object in data.json.objects.values() {
+            if cli.cutoff > object.faults || !object.show {
                 continue;
             }
-            let mut name = perf.strings.resolve(object.1.file).unwrap().to_string();
+            let mut name = data.json.strings.resolve(object.file).unwrap().to_string();
             let start = object
-                .1
                 .smallest_offset
                 .next_multiple_of(PAGE_SIZE)
                 .saturating_sub(PAGE_SIZE);
-            let end = object.1.biggest_offset.next_multiple_of(PAGE_SIZE);
+            let end = object.biggest_offset.next_multiple_of(PAGE_SIZE);
             let bar_size = ((end - start) / cli.width as u64)
                 .max(PAGE_SIZE)
                 .next_multiple_of(PAGE_SIZE);
@@ -214,8 +213,8 @@ impl FaultVis {
                 let cut = name.len().saturating_sub(cli.width - 8);
                 name = "...".to_string() + &name[cut..name.len()];
             }
-            object.1.vis_idx = Some(file_vis.len());
-            file_vis.push(FileFaultVis::new(name, start, end, bar_size, object.1.idx));
+            map.insert(object.idx, file_vis.len());
+            file_vis.push(FileFaultVis::new(name, start, end, bar_size));
         }
         Self {
             file_vis,
@@ -223,12 +222,11 @@ impl FaultVis {
         }
     }
 
-    pub fn fault(&mut self, fault: &Event, perf: &PerfData) {
-        let obj = &perf.objects[fault.obj_idx];
-        let Some(idx) = obj.vis_idx else {
+    pub fn fault(&mut self, fault: &EventRecord, data: &FaultData, map: &HashMap<usize, usize>) {
+        let Some(idx) = map.get(&fault.obj_id()) else {
             return;
         };
-        self.file_vis[idx].fault(fault, perf);
+        self.file_vis[*idx].fault(fault, data);
     }
 }
 
@@ -245,7 +243,7 @@ impl Widget for &FaultVis {
         let vcount = (self.file_vis.len() / hcount + 1).min(MAX_V);
         let layout = Layout::new(
             Direction::Vertical,
-            Constraint::from_lengths(vec![3u16; vcount]),
+            Constraint::from_lengths(vec![4u16; vcount]),
         )
         .flex(Flex::SpaceAround);
         let splits = layout.split(area);
@@ -262,7 +260,8 @@ impl Widget for &FaultVis {
             .collect::<Vec<_>>();
 
         for (idx, fv) in self.file_vis.iter().enumerate() {
-            let area = allsplits[idx / hcount][idx % hcount];
+            let area = &allsplits[idx / hcount];
+            let area = area[idx % hcount];
             fv.render(area, buf);
         }
     }
@@ -279,30 +278,35 @@ pub struct Status {
 }
 
 impl Status {
-    pub fn new(cli: &PlayCli, perf: &PerfData) -> Self {
-        let end_time = perf
-            .faults
+    pub fn new(cli: &PlayCli, data: &FaultData) -> Self {
+        let end_time = data
+            .records
+            .slice()
             .iter()
-            .max_by(|a, b| a.time.cmp(&b.time))
-            .map_or(Duration::ZERO, |f| f.time);
+            .max_by(|a, b| a.time().cmp(&b.time()))
+            .map_or(Duration::ZERO, |f| f.time());
         Self {
-            num_events: perf.faults.len(),
+            num_events: data.records.slice().len(),
             cur_event: 0,
             end_time,
             cur_time: Duration::ZERO,
-            trace_file: cli.trace_file.to_string_lossy().to_string(),
+            trace_file: cli
+                .trace_file
+                .as_ref()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or("pfviz.json".into()),
             log: Vec::new(),
         }
     }
 
-    pub fn fault(&mut self, idx: usize, fault: &Event, perf: &PerfData) {
-        let off = humansize::format_size(fault.offset, humansize::BINARY);
+    pub fn fault(&mut self, idx: usize, fault: &EventRecord, data: &FaultData) {
+        let off = humansize::format_size(fault.offset(), humansize::BINARY);
         let s = format!(
             "{:10}: {} to {} within {}",
             idx,
-            fault.kind.to_string(),
+            fault.kind().to_string(),
             off,
-            perf.object_name(fault.obj_idx)
+            data.object_name(fault)
         );
         self.log.push(s);
     }

@@ -70,14 +70,16 @@ pub fn trace(cli: &TraceCli) -> Result<()> {
             .clone()
             .unwrap_or_else(|| PathBuf::from("pfviz.dat")),
     )?;
-    let out_file_strings = File::create(
+    let out_file_json = File::create(
         cli.output
             .clone()
             .unwrap_or_else(|| PathBuf::from("pfviz.json")),
     )?;
-    crate::perf::write_perf_data(&perf_data, BufWriter::new(out_file))?;
-
-    serde_json::to_writer(out_file_strings, &perf_data.strings)?;
+    crate::perf::write_perf_data(
+        &perf_data,
+        BufWriter::new(out_file),
+        BufWriter::new(out_file_json),
+    )?;
 
     Ok(())
 }

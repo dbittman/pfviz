@@ -3,7 +3,7 @@ use std::time::Duration;
 use crate::{
     PlayCli,
     event::{AppEvent, Event, EventHandler, TICK_FPS},
-    perf::PerfData,
+    perf::FaultData,
     ui::Ui,
 };
 use ratatui::{
@@ -18,26 +18,26 @@ pub struct App {
     pub running: bool,
     pub events: EventHandler,
     pub ui: Ui,
-    pub perf: PerfData,
+    pub data: FaultData,
     pub cli: PlayCli,
 }
 
 impl App {
     /// Constructs a new instance of [`App`].
-    pub fn new(cli: PlayCli, mut perf: PerfData) -> Self {
+    pub fn new(cli: PlayCli, data: FaultData) -> Self {
         Self {
             running: true,
             paused: true,
             events: EventHandler::new(),
-            ui: Ui::new(&cli, &mut perf),
-            perf,
+            ui: Ui::new(&cli, &data),
+            data,
             cli,
         }
     }
 
     /// Run the application's main loop.
     pub fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
-        terminal.clear();
+        terminal.clear().unwrap();
         while self.running {
             terminal.draw(|frame| frame.render_widget(&self, frame.area()))?;
             self.handle_events()?;
@@ -140,20 +140,20 @@ impl App {
         if self.ui.status.cur_event >= self.ui.status.num_events {
             return None;
         }
-        let fault = &self.perf.faults[self.ui.status.cur_event];
-        Some(fault.time)
+        let fault = &self.data.records.slice()[self.ui.status.cur_event];
+        Some(fault.time())
     }
 
     pub fn increment_counter(&mut self) {
         if self.ui.status.cur_event >= self.ui.status.num_events {
             return;
         }
-        let fault = &self.perf.faults[self.ui.status.cur_event];
-        self.ui.fault_vis.fault(fault, &self.perf);
+        let fault = &self.data.records.slice()[self.ui.status.cur_event];
+        self.ui.fault_vis.fault(fault, &self.data, &self.ui.map);
         self.ui
             .status
-            .fault(self.ui.status.cur_event, fault, &self.perf);
-        self.ui.status.cur_time = fault.time;
+            .fault(self.ui.status.cur_event, fault, &self.data);
+        self.ui.status.cur_time = fault.time();
         if self.ui.status.cur_event < self.ui.status.num_events {
             self.ui.status.cur_event += 1;
         }
