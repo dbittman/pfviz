@@ -16,6 +16,7 @@ use ratatui::{
 pub struct App {
     pub paused: bool,
     pub running: bool,
+    pub looping: bool,
     pub events: EventHandler,
     pub ui: Ui,
     pub data: FaultData,
@@ -26,6 +27,7 @@ impl App {
     /// Constructs a new instance of [`App`].
     pub fn new(cli: PlayCli, data: FaultData) -> Self {
         Self {
+            looping: true,
             running: true,
             paused: true,
             events: EventHandler::new(),
@@ -53,10 +55,17 @@ impl App {
                 _ => {}
             },
             Event::App(app_event) => match app_event {
-                AppEvent::Increment => self.increment_counter(),
+                AppEvent::Increment => self.increment_counter(1),
                 AppEvent::Decrement => self.decrement_counter(),
                 AppEvent::TogglePause => self.set_pause(!self.paused),
                 AppEvent::Quit => self.quit(),
+                AppEvent::MoveUp => self.ui.fault_vis.move_highlight(true),
+                AppEvent::MoveDown => self.ui.fault_vis.move_highlight(false),
+                AppEvent::Char(c) => match c {
+                    'b' => self.ui.fault_vis.toggle_break(),
+                    'l' => self.looping = !self.looping,
+                    _ => {}
+                },
             },
         }
         Ok(())
@@ -71,6 +80,11 @@ impl App {
             }
             KeyCode::Right => self.events.send(AppEvent::Increment),
             KeyCode::Left => self.events.send(AppEvent::Decrement),
+
+            KeyCode::Up => self.events.send(AppEvent::MoveUp),
+            KeyCode::Down => self.events.send(AppEvent::MoveDown),
+            KeyCode::Char('b') => self.events.send(AppEvent::Char('b')),
+            KeyCode::Char('l') => self.events.send(AppEvent::Char('l')),
             KeyCode::Char(' ') => self.events.send(AppEvent::TogglePause),
             // Other handlers you could add here.
             _ => {}
@@ -86,12 +100,21 @@ impl App {
         if self.paused {
             return;
         }
+        if self.looping {
+            if self.ui.status.cur_event >= self.ui.status.num_events {
+                self.ui.reset();
+            }
+        }
         match self.cli.play_mode {
             crate::PlaybackMode::FrameTime => {
                 let dt = Duration::from_secs_f64(self.cli.play_speed as f64);
                 let next_time = self.ui.status.cur_time + dt;
                 while self.ui.status.cur_time < next_time {
-                    self.increment_counter();
+                    let count = self.count_events_before(next_time);
+                    if count == 0 {
+                        break;
+                    }
+                    self.increment_counter(count);
                     if self.ui.status.cur_event >= self.ui.status.num_events {
                         break;
                     }
@@ -100,7 +123,7 @@ impl App {
             crate::PlaybackMode::FrameStep => {
                 let mut i = 0;
                 loop {
-                    self.increment_counter();
+                    self.increment_counter(1);
                     i += 1;
                     if i as f32 > self.cli.play_speed {
                         break;
@@ -122,7 +145,11 @@ impl App {
                         self.ui.status.cur_time = next_time;
                         break;
                     }
-                    self.increment_counter();
+                    let count = self.count_events_before(next_time);
+                    if count == 0 {
+                        break;
+                    }
+                    self.increment_counter(count);
                     if self.ui.status.cur_event >= self.ui.status.num_events {
                         break;
                     }
@@ -144,18 +171,46 @@ impl App {
         Some(fault.time())
     }
 
-    pub fn increment_counter(&mut self) {
+    pub fn count_events_before(&self, time: Duration) -> usize {
+        if self.ui.status.cur_event >= self.ui.status.num_events {
+            return 0;
+        }
+        let faults = &self.data.records.slice()[self.ui.status.cur_event..];
+        faults
+            .iter()
+            .position(|f| f.time() > time)
+            .unwrap_or(faults.len())
+    }
+
+    pub fn increment_counter(&mut self, count: usize) {
         if self.ui.status.cur_event >= self.ui.status.num_events {
             return;
         }
-        let fault = &self.data.records.slice()[self.ui.status.cur_event];
-        self.ui.fault_vis.fault(fault, &self.data, &self.ui.map);
-        self.ui
-            .status
-            .fault(self.ui.status.cur_event, fault, &self.data);
-        self.ui.status.cur_time = fault.time();
+
+        let faults = &self.data.records.slice()[self.ui.status.cur_event..];
+        let count = count.min(faults.len());
+        let faults = &faults[0..count];
+        if faults.len() == 0 {
+            return;
+        }
+
+        let res = self.ui.fault_vis.fault(faults, &self.data, &self.ui.map);
+        if res.count == 0 {
+            return;
+        }
+        self.ui.status.fault(
+            self.ui.status.cur_event,
+            faults,
+            &self.data,
+            res.hit_breakpoint,
+        );
+        self.ui.status.cur_time = faults[res.count - 1].time();
         if self.ui.status.cur_event < self.ui.status.num_events {
-            self.ui.status.cur_event += 1;
+            self.ui.status.cur_event += res.count;
+        }
+
+        if res.hit_breakpoint {
+            self.set_pause(true);
         }
     }
 

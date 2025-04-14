@@ -1,10 +1,9 @@
 use std::{collections::HashMap, time::Duration};
 
-use itertools::Itertools;
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Flex, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Style, Stylize},
     widgets::{Block, Borders, Paragraph, Sparkline, SparklineBar, Widget},
 };
 
@@ -30,6 +29,11 @@ impl Ui {
             map,
         }
     }
+
+    pub fn reset(&mut self) {
+        self.status.reset();
+        self.fault_vis.reset();
+    }
 }
 
 impl Widget for &App {
@@ -40,7 +44,10 @@ impl Widget for &App {
     // - https://docs.rs/ratatui/latest/ratatui/widgets/index.html
     // - https://github.com/ratatui/ratatui/tree/master/examples
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let layout = Layout::new(Direction::Vertical, Constraint::from_percentages([70, 30]));
+        let layout = Layout::new(
+            Direction::Vertical,
+            &[Constraint::Fill(1), Constraint::Length(6)],
+        );
         let split = layout.split(area);
 
         self.ui.fault_vis.render(split[0], buf);
@@ -50,7 +57,7 @@ impl Widget for &App {
 
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)]
-pub struct FaultInfo {
+pub struct RegionInfo {
     last_addr: u64,
     value: Option<u64>,
     time: Duration,
@@ -58,7 +65,7 @@ pub struct FaultInfo {
     has_major: Option<u32>,
 }
 
-impl FaultInfo {
+impl RegionInfo {
     pub const fn new(last_addr: u64, time: Duration, style: Style) -> Self {
         Self {
             last_addr,
@@ -71,94 +78,143 @@ impl FaultInfo {
 }
 
 #[derive(Debug)]
-pub struct FileFaultVis {
-    data: Vec<FaultInfo>,
+pub struct FileVis {
+    faultdata: Vec<RegionInfo>,
+    cachedata: Vec<RegionInfo>,
     name: String,
     start_off: u64,
     end_off: u64,
     bar_size: u64,
     faults: usize,
+    misses: usize,
+    is_highlighted: bool,
+    breakpoint: bool,
 }
 
-impl Into<SparklineBar> for &FaultInfo {
+impl Into<SparklineBar> for &RegionInfo {
     fn into(self) -> SparklineBar {
         SparklineBar::from(self.value).style(self.style)
     }
 }
 
-impl FileFaultVis {
+#[derive(Clone, Copy)]
+pub struct FaultProcessResult {
+    pub hit_breakpoint: bool,
+    pub count: usize,
+}
+
+impl FileVis {
     pub fn new(name: String, start_off: u64, end_off: u64, bar_size: u64) -> Self {
         let len = ((1 + end_off - start_off) / bar_size) - 1;
         let data = vec![
-            FaultInfo::new(0, Duration::ZERO, Style::default().bg(Color::DarkGray));
+            RegionInfo::new(0, Duration::ZERO, Style::default().bg(Color::DarkGray));
             len.try_into().unwrap()
         ];
         Self {
             faults: 0,
-            data,
+            faultdata: data.clone(),
+            cachedata: data,
             name,
             start_off,
             end_off,
             bar_size,
+            misses: 0,
+            is_highlighted: false,
+            breakpoint: false,
         }
     }
 
-    pub fn fault(&mut self, fault: &EventRecord, _data: &FaultData) {
-        let pos = ((fault.offset() - self.start_off) / self.bar_size) as usize;
-        if pos >= self.data.len() {
-            return;
-        }
-        self.faults += 1;
+    pub fn reset(&mut self) {
+        let len = ((1 + self.end_off - self.start_off) / self.bar_size) - 1;
+        let data = vec![
+            RegionInfo::new(0, Duration::ZERO, Style::default().bg(Color::DarkGray));
+            len.try_into().unwrap()
+        ];
+        self.faultdata = data.clone();
+        self.cachedata = data.clone();
+        self.misses = 0;
+        self.faults = 0;
+    }
 
-        let mut has_recent_major = if let Some(count) = &mut self.data[pos].has_major {
-            if *count == 0 {
-                false
+    pub fn toggle_break(&mut self) {
+        self.breakpoint = !self.breakpoint;
+    }
+
+    pub fn fault(&mut self, faults: &[EventRecord], _fd: &FaultData) -> FaultProcessResult {
+        for (idx, fault) in faults.iter().enumerate() {
+            let pos = ((fault.offset() - self.start_off) / self.bar_size) as usize;
+            let region_vec = if fault.kind().is_miss() {
+                self.misses += 1;
+                &mut self.cachedata
             } else {
-                *count -= 1;
-                true
+                self.faults += 1;
+                &mut self.faultdata
+            };
+            if pos >= region_vec.len() {
+                continue;
             }
-        } else {
-            false
-        };
 
-        if fault.kind() == EventKind::MajorFault {
-            self.data[pos].has_major = Some(100);
-            has_recent_major = true;
-        }
+            let mut has_recent_major = if let Some(count) = &mut region_vec[pos].has_major {
+                if *count == 0 {
+                    false
+                } else {
+                    *count -= 1;
+                    true
+                }
+            } else {
+                false
+            };
 
-        if !has_recent_major {
-            self.data[pos].has_major = None;
-        }
+            if fault.kind() == EventKind::MajorFault {
+                region_vec[pos].has_major = Some(100);
+                has_recent_major = true;
+            }
 
-        let mut colors = if fault.kind() == EventKind::MajorFault {
-            (Color::LightRed, Color::Red)
-        } else if has_recent_major {
-            (Color::LightMagenta, Color::Magenta)
-        } else {
-            (Color::LightBlue, Color::Blue)
-        };
+            if !has_recent_major {
+                region_vec[pos].has_major = None;
+            }
 
-        if fault.kind().is_miss() {
-            colors = (Color::LightGreen, Color::Green);
-        }
+            let mut colors = if fault.kind() == EventKind::MajorFault {
+                (Color::LightRed, Color::Red)
+            } else if has_recent_major {
+                (Color::LightMagenta, Color::Magenta)
+            } else {
+                (Color::LightBlue, Color::Blue)
+            };
 
-        self.data[pos as usize] = FaultInfo::new(
-            fault.offset(),
-            fault.time(),
-            Style::default().fg(colors.0).bg(colors.1),
-        );
-        for i in 0..self.data.len() {
-            if i != pos as usize {
-                if self.data[i].value == Some(1) {
-                    self.data[i].value = Some(0);
+            if fault.kind().is_miss() {
+                colors = (Color::LightGreen, Color::Green);
+            }
+
+            region_vec[pos as usize] = RegionInfo::new(
+                fault.offset(),
+                fault.time(),
+                Style::default().fg(colors.0).bg(colors.1),
+            );
+            for i in 0..region_vec.len() {
+                if i != pos as usize {
+                    if region_vec[i].value == Some(1) {
+                        region_vec[i].value = Some(0);
+                    }
                 }
             }
+            region_vec[pos as usize].value = Some(1);
+
+            if self.breakpoint {
+                return FaultProcessResult {
+                    count: idx + 1,
+                    hit_breakpoint: true,
+                };
+            }
         }
-        self.data[pos as usize].value = Some(1);
+        FaultProcessResult {
+            count: faults.len(),
+            hit_breakpoint: false,
+        }
     }
 }
 
-impl Widget for &FileFaultVis {
+impl Widget for &FileVis {
     fn render(self, area: Rect, buf: &mut Buffer)
     where
         Self: Sized,
@@ -166,30 +222,50 @@ impl Widget for &FileFaultVis {
         let start = humansize::format_size(self.start_off, humansize::BINARY);
         let end = humansize::format_size(self.end_off, humansize::BINARY);
         let bs = humansize::format_size(self.bar_size, humansize::BINARY);
-        let sparkline = Sparkline::default()
-            .max(1)
-            .block(
-                Block::new()
-                    .title(&*self.name)
-                    .borders(Borders::ALL)
-                    .title_bottom(format!(
-                        "[{}-{}): {} {} bars, {} faults",
-                        start,
-                        end,
-                        self.data.len(),
-                        bs,
-                        self.faults,
-                    )),
-            )
-            .data(&self.data);
-        sparkline.render(area, buf);
+        let style = if self.is_highlighted {
+            Style::default().bold()
+        } else {
+            Style::default()
+        };
+        let title = if self.breakpoint {
+            &format!("(B) {}", self.name.as_str())
+        } else {
+            &self.name
+        };
+        let block = Block::new()
+            .title(title.as_str())
+            .title_style(style)
+            .borders(Borders::ALL)
+            .title_bottom(format!(
+                "[{}-{}): {} {} bars, {}/{} f/m",
+                start,
+                end,
+                self.faultdata.len(),
+                bs,
+                self.faults,
+                self.misses
+            ));
+
+        let inner = block.inner(area);
+        let inner_layout = Layout::new(
+            Direction::Vertical,
+            &[Constraint::Length(1), Constraint::Length(1)],
+        );
+        let splits = inner_layout.split(inner);
+
+        let fault_sparkline = Sparkline::default().max(1).data(&self.faultdata);
+        let cache_sparkline = Sparkline::default().max(1).data(&self.cachedata);
+        block.render(area, buf);
+        cache_sparkline.render(splits[0], buf);
+        fault_sparkline.render(splits[1], buf);
     }
 }
 
 #[derive(Debug)]
 pub struct FaultVis {
-    file_vis: Vec<FileFaultVis>,
+    file_vis: Vec<FileVis>,
     width: u16,
+    highlighted: Option<usize>,
 }
 
 impl FaultVis {
@@ -214,19 +290,72 @@ impl FaultVis {
                 name = "...".to_string() + &name[cut..name.len()];
             }
             map.insert(object.idx, file_vis.len());
-            file_vis.push(FileFaultVis::new(name, start, end, bar_size));
+            file_vis.push(FileVis::new(name, start, end, bar_size));
         }
         Self {
             file_vis,
             width: cli.width as u16,
+            highlighted: None,
         }
     }
 
-    pub fn fault(&mut self, fault: &EventRecord, data: &FaultData, map: &HashMap<usize, usize>) {
-        let Some(idx) = map.get(&fault.obj_id()) else {
+    pub fn reset(&mut self) {
+        for fv in &mut self.file_vis {
+            fv.reset();
+        }
+    }
+
+    pub fn fault(
+        &mut self,
+        faults: &[EventRecord],
+        data: &FaultData,
+        map: &HashMap<usize, usize>,
+    ) -> FaultProcessResult {
+        let mut count = 0;
+        for fault in faults {
+            let Some(idx) = map.get(&fault.obj_id()) else {
+                continue;
+            };
+            let res = self.file_vis[*idx].fault(&[*fault], data);
+            if res.hit_breakpoint {
+                return FaultProcessResult {
+                    hit_breakpoint: true,
+                    count: count + res.count,
+                };
+            }
+            count += res.count;
+        }
+
+        FaultProcessResult {
+            hit_breakpoint: false,
+            count: faults.len(),
+        }
+    }
+
+    pub fn toggle_break(&mut self) {
+        let Some(highlight) = self.highlighted else {
             return;
         };
-        self.file_vis[*idx].fault(fault, data);
+
+        self.file_vis[highlight].toggle_break()
+    }
+
+    pub fn move_highlight(&mut self, up: bool) {
+        if let Some(old) = self.highlighted {
+            self.file_vis[old].is_highlighted = false;
+        }
+        let value = self
+            .highlighted
+            .map(|old| {
+                if up {
+                    old.saturating_sub(1)
+                } else {
+                    old.saturating_add(1).min(self.file_vis.len() - 1)
+                }
+            })
+            .unwrap_or(0);
+        self.highlighted = Some(value);
+        self.file_vis[value].is_highlighted = true;
     }
 }
 
@@ -274,7 +403,7 @@ pub struct Status {
     pub end_time: Duration,
     pub cur_time: Duration,
     trace_file: String,
-    pub log: Vec<String>,
+    pub current: String,
 }
 
 impl Status {
@@ -295,24 +424,41 @@ impl Status {
                 .as_ref()
                 .map(|f| f.to_string_lossy().to_string())
                 .unwrap_or("pfviz.json".into()),
-            log: Vec::new(),
+            current: "".into(),
         }
     }
 
-    pub fn fault(&mut self, idx: usize, fault: &EventRecord, data: &FaultData) {
+    pub fn reset(&mut self) {
+        self.cur_event = 0;
+        self.cur_time = Duration::ZERO;
+        self.current = "".into();
+    }
+
+    pub fn fault(
+        &mut self,
+        idx: usize,
+        faults: &[EventRecord],
+        data: &FaultData,
+        hit_breakpoint: bool,
+    ) {
+        if faults.len() == 0 {
+            return;
+        }
+        let fault = faults.last().unwrap();
         let off = humansize::format_size(fault.offset(), humansize::BINARY);
         let s = format!(
-            "{:10}: {} to {} within {}",
+            "(..{}) {:10}: {} to {} within {}{}",
+            faults.len() - 1,
             idx,
             fault.kind().to_string(),
             off,
-            data.object_name(fault)
+            data.object_name(fault),
+            if hit_breakpoint { "[BREAKPOINT]" } else { "" }
         );
-        self.log.push(s);
+        self.current = s;
     }
 }
 
-const LOG_LEN: usize = 5;
 impl Widget for &Status {
     fn render(self, area: Rect, buf: &mut Buffer)
     where
@@ -334,17 +480,11 @@ impl Widget for &Status {
         ))
         .block(Block::default().borders(Borders::ALL).title("Status"));
 
-        let layout = Layout::vertical([Constraint::Min(LOG_LEN as u16 + 2), Constraint::Length(3)]);
+        let layout = Layout::vertical([Constraint::Length(3), Constraint::Length(3)]);
         let splits = layout.split(area);
 
-        let log = Paragraph::new(
-            self.log
-                .iter()
-                .rev()
-                .take(splits[0].as_size().height as usize - 2)
-                .join("\n"),
-        )
-        .block(Block::default().borders(Borders::ALL).title("Fault Log"));
+        let log = Paragraph::new(self.current.as_str())
+            .block(Block::default().borders(Borders::ALL).title("Fault Log"));
 
         line.render(splits[1], buf);
         log.render(splits[0], buf);

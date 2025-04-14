@@ -40,6 +40,9 @@ pub enum AppEvent {
     /// Quit the application.
     Quit,
     TogglePause,
+    MoveUp,
+    MoveDown,
+    Char(char),
 }
 
 /// Terminal event handler.
