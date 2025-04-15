@@ -103,6 +103,9 @@ pub struct FaultProcessResult {
     pub count: usize,
 }
 
+const CACHE_SET: u64 = 10000;
+const CACHE_MAX: u64 = 9000;
+
 impl FileVis {
     pub fn new(name: String, start_off: u64, end_off: u64, bar_size: u64) -> Self {
         let len = ((1 + end_off - start_off) / bar_size) - 1;
@@ -193,12 +196,20 @@ impl FileVis {
             );
             for i in 0..region_vec.len() {
                 if i != pos as usize {
-                    if region_vec[i].value == Some(1) {
-                        region_vec[i].value = Some(0);
+                    if fault.kind().is_miss() {
+                        if region_vec[i].value == Some(0) {
+                            region_vec[i].value = None;
+                        }
+                    }
+                    if let Some(ref mut val) = region_vec[i].value {
+                        if *val > 0 {
+                            *val -= 1;
+                        }
                     }
                 }
             }
-            region_vec[pos as usize].value = Some(1);
+            region_vec[pos as usize].value =
+                Some(if fault.kind().is_miss() { CACHE_SET } else { 1 });
 
             if self.breakpoint {
                 return FaultProcessResult {
@@ -254,7 +265,7 @@ impl Widget for &FileVis {
         let splits = inner_layout.split(inner);
 
         let fault_sparkline = Sparkline::default().max(1).data(&self.faultdata);
-        let cache_sparkline = Sparkline::default().max(1).data(&self.cachedata);
+        let cache_sparkline = Sparkline::default().max(CACHE_MAX).data(&self.cachedata);
         block.render(area, buf);
         cache_sparkline.render(splits[0], buf);
         fault_sparkline.render(splits[1], buf);

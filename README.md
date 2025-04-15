@@ -6,9 +6,9 @@ Visualize page faults and cache misses to memory-mapped files during a running p
 
 This program has two basic modes, trace and play. In trace mode, the program will run another program and use perf to trace it, capturing page faults and additional events. The user can specify any number of extra events to capture with the -e flag. For example, on machines with this particular perf event, cache misses can be traced like this:
 
-`cargo run --release -- trace -e mem_load_retired.l3_miss:ppu,miss`
+`pfviz trace -e mem_load_retired.l3_miss:ppu,miss <program> <program-args>`
 
-The ',miss' is to inform pfviz what kind of event this is.
+The ',miss' is to inform pfviz what kind of event this is. This will generate a pfviz.dat and pfviz.json file, which together can be used by the play mode to visualize the faults and misses of that program in real time.
 
 Note that not all events are supported on all architectures or CPUs. Check perf list for events. For cache miss tracking, the event will need to be a "precise" event.
 
