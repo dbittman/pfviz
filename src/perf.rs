@@ -11,7 +11,32 @@ use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use stable_vec::StableVec;
-use string_interner::{DefaultStringInterner, DefaultSymbol, StringInterner, Symbol};
+
+#[derive(Default, Deserialize, Serialize, Debug, Clone)]
+pub struct Interner {
+    map: HashMap<u32, String>,
+    revmap: HashMap<String, u32>,
+    next_id: u32,
+}
+
+impl Interner {
+    pub fn get_or_intern(&mut self, s: &str) -> u32 {
+        if let Some(k) = self.revmap.get(s) {
+            return *k;
+        }
+
+        let id = self.next_id;
+        self.next_id += 1;
+
+        self.map.insert(id, s.to_string());
+        self.revmap.insert(s.to_string(), id);
+        id
+    }
+
+    pub fn resolve(&self, k: u32) -> Option<&str> {
+        self.map.get(&k).map(|s| s.as_str())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Ord, Eq)]
 pub enum EventKind {
@@ -54,6 +79,17 @@ impl From<u32> for EventKind {
     }
 }
 
+impl From<&str> for EventKind {
+    fn from(value: &str) -> Self {
+        match value {
+            "major-fault" | "major" => EventKind::MajorFault,
+            "minor-fault" | "minor" => EventKind::MinorFault,
+            "cache-miss" | "miss" => EventKind::CacheMiss,
+            _ => EventKind::Unknown,
+        }
+    }
+}
+
 impl ToString for EventKind {
     fn to_string(&self) -> String {
         match self {
@@ -70,7 +106,7 @@ impl ToString for EventKind {
 pub struct PerfData {
     pub faults: Vec<Event>,
     pub objects: StableVec<Object>,
-    pub strings: DefaultStringInterner,
+    pub strings: Interner,
 }
 
 impl PerfData {
@@ -85,9 +121,9 @@ pub const PAGE_SIZE: u64 = 0x1000;
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct PerfEvent {
-    name: DefaultSymbol,
-    sym: DefaultSymbol,
-    addr_sym: DefaultSymbol,
+    name: u32,
+    sym: u32,
+    addr_sym: u32,
     addr: u64,
     ip: u64,
     time: Timestamp,
@@ -108,7 +144,7 @@ impl Into<Duration> for Timestamp {
 
 #[derive(Debug, Clone, Copy)]
 pub struct MMap {
-    file: DefaultSymbol,
+    file: u32,
     offset: u64,
     addr: u64,
     len: u64,
@@ -116,7 +152,7 @@ pub struct MMap {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct Object {
-    pub file: DefaultSymbol,
+    pub file: u32,
     pub idx: usize,
     pub maps: usize,
     pub faults: usize,
@@ -132,20 +168,21 @@ pub struct Event {
     pub was_write: bool,
     pub time: Duration,
     pub kind: EventKind,
-    pub event_name: DefaultSymbol,
+    pub event_name: u32,
     pub addr: u64,
     pub ip: u64,
     pub tid: u32,
 }
 
-pub fn parse_perf_data<Io: Read>(reader: BufReader<Io>) -> Result<PerfData> {
-    let mut strings = StringInterner::<
-        string_interner::DefaultBackend,
-        string_interner::DefaultHashBuilder,
-    >::new();
+pub fn parse_perf_data<Io: Read>(
+    reader: BufReader<Io>,
+    ev_map: HashMap<&str, EventKind>,
+) -> Result<PerfData> {
+    let mut strings = Interner::default();
     let mut events = Vec::new();
     let mut maps = Vec::new();
     let mut count = 0;
+    tracing::info!("Reading from perf data");
     for line in reader.lines().enumerate() {
         if let Ok(line) = line.1 {
             let split = line.split_whitespace().collect::<SmallVec<[_; 16]>>();
@@ -202,13 +239,15 @@ pub fn parse_perf_data<Io: Read>(reader: BufReader<Io>) -> Result<PerfData> {
                     bail!("invalid line: {}", line);
                 };
                 let ip = u64::from_str_radix(split[ip_nr], 16)
-                    .inspect_err(|_| tracing::warn!("invalid line: {}", line))?;
+                    .inspect_err(|_| tracing::warn!("invalid line: {}, recording IP as 0", line))
+                    .unwrap_or(0);
 
                 if u64::from_str_radix(addr_sym, 16).is_ok() {
                     // Probably means the symbol wasn't printed.
                     addr_sym = "[unknown]";
                 }
 
+                let name = name.strip_suffix(":").unwrap_or(name);
                 let name = strings.get_or_intern(name);
                 let sym = strings.get_or_intern(sym);
                 let addr_sym = strings.get_or_intern(addr_sym);
@@ -273,7 +312,11 @@ pub fn parse_perf_data<Io: Read>(reader: BufReader<Io>) -> Result<PerfData> {
                         } else if event_name.starts_with("cache-misses") {
                             Some(EventKind::CacheMiss)
                         } else {
-                            Some(EventKind::Unknown)
+                            if let Some(kind) = ev_map.get(event_name) {
+                                Some(*kind)
+                            } else {
+                                Some(EventKind::Unknown)
+                            }
                         };
                         kind.map(|kind| Event {
                             obj_idx: info.0,
@@ -397,7 +440,7 @@ impl RecordHeader {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JsonRoot {
     pub objects: HashMap<usize, Object>,
-    pub strings: DefaultStringInterner,
+    pub strings: Interner,
 }
 
 pub fn write_perf_data<W: Write, WJ: Write>(
@@ -418,7 +461,7 @@ pub fn write_perf_data<W: Write, WJ: Write>(
             time_ns: ev.time.as_nanos() as u64,
             kind: ev.kind.into(),
             flags: 0,
-            event_name: ev.event_name.to_usize() as u32,
+            event_name: ev.event_name,
             obj_id: ev.obj_idx as u32,
             tid: ev.tid,
             cpu: 0,

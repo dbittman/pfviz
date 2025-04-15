@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::File,
     io::{BufReader, BufWriter},
     path::PathBuf,
@@ -7,7 +8,7 @@ use std::{
 
 use color_eyre::eyre::{Result, bail};
 
-use crate::TraceCli;
+use crate::{TraceCli, perf::EventKind};
 
 pub fn trace(cli: &TraceCli) -> Result<()> {
     let mut command = Command::new("perf");
@@ -18,6 +19,7 @@ pub fn trace(cli: &TraceCli) -> Result<()> {
         .arg("1")
         .arg("--all-user");
 
+    let mut ev_map = HashMap::new();
     for event in &cli.events {
         let split = event.split(",").collect::<Vec<_>>();
         if split.len() != 2 {
@@ -26,6 +28,8 @@ pub fn trace(cli: &TraceCli) -> Result<()> {
             );
         }
         command.arg("-e").arg(split[0]);
+
+        ev_map.insert(split[0], EventKind::from(split[1]));
     }
 
     command.arg("-e").arg("major-faults:u");
@@ -59,7 +63,7 @@ pub fn trace(cli: &TraceCli) -> Result<()> {
 
     let stdout = child.stdout.take().unwrap();
 
-    let perf_data = crate::perf::parse_perf_data(BufReader::new(stdout))?;
+    let perf_data = crate::perf::parse_perf_data(BufReader::new(stdout), ev_map)?;
 
     if !child.wait()?.success() {
         bail!("perf script failed");

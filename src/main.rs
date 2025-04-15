@@ -109,7 +109,7 @@ struct Cli {
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
+        .with_max_level(tracing::Level::INFO)
         .init();
 
     let cli = Cli::parse();
@@ -141,9 +141,16 @@ fn main() -> color_eyre::Result<()> {
                 data.records.slice().len()
             );
             println!("objects:");
+            let mut v = vec![];
             for obj in &data.json.objects {
                 let name = data.json.strings.resolve(obj.1.file).unwrap_or("[unknown]");
-                println!("{:4}: {} {}", obj.0, obj.1.faults, name);
+                v.push((obj, name));
+            }
+
+            v.sort_by(|a, b| a.0.1.faults.cmp(&b.0.1.faults));
+
+            for obj in v {
+                println!("{:4}: {} {}", obj.0.0, obj.0.1.faults, obj.1);
             }
 
             Ok(())
