@@ -46,7 +46,7 @@ impl Widget for &App {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let layout = Layout::new(
             Direction::Vertical,
-            &[Constraint::Fill(1), Constraint::Length(6)],
+            &[Constraint::Fill(1), Constraint::Length(8)],
         );
         let split = layout.split(area);
 
@@ -404,6 +404,10 @@ pub struct Status {
     pub cur_time: Duration,
     trace_file: String,
     pub current: String,
+    pub marker_a: Option<usize>,
+    pub marker_b: Option<usize>,
+    pub looping: bool,
+    pub paused: bool,
 }
 
 impl Status {
@@ -425,6 +429,10 @@ impl Status {
                 .map(|f| f.to_string_lossy().to_string())
                 .unwrap_or("pfviz.json".into()),
             current: "".into(),
+            marker_a: None,
+            marker_b: None,
+            looping: true,
+            paused: true,
         }
     }
 
@@ -472,21 +480,108 @@ impl Widget for &Status {
         let em = (self.end_time.as_secs() / 60) % 60;
         let eh = (self.end_time.as_secs() / 3600) % 60;
         let en = self.end_time.as_nanos() % 1_000_000_000;
-        let cur_time = format!("{:02}:{:02}:{:02}.{:06}", ch, cm, cs, cn);
-        let end_time = format!("{:02}:{:02}:{:02}.{:06}", eh, em, es, en);
-        let line = Paragraph::new(format!(
-            "trace {}: event {} / {} at time {} of {}",
-            &self.trace_file, self.cur_event, self.num_events, cur_time, end_time
-        ))
-        .block(Block::default().borders(Borders::ALL).title("Status"));
+        let cur_time = format!("{:02}:{:02}:{:02}.{:09}", ch, cm, cs, cn);
+        let end_time = format!("{:02}:{:02}:{:02}.{:09}", eh, em, es, en);
 
-        let layout = Layout::vertical([Constraint::Length(3), Constraint::Length(3)]);
-        let splits = layout.split(area);
+        let mut status_title = format!("Playback [{}]", &self.trace_file);
+        if let Some(a) = self.marker_a {
+            status_title += &format!("(Marker A: {:10})", a);
+        }
+        if let Some(b) = self.marker_b {
+            status_title += &format!("(Marker B: {:10})", b);
+        }
 
-        let log = Paragraph::new(self.current.as_str())
-            .block(Block::default().borders(Borders::ALL).title("Fault Log"));
+        if self.paused {
+            status_title += "(paused)";
+        }
 
-        line.render(splits[1], buf);
-        log.render(splits[0], buf);
+        if self.looping {
+            status_title += "(looping)";
+        }
+
+        let playback_block = Block::default().borders(Borders::ALL).title(status_title).title_bottom("Help: (q) Quit; (Left/Right) Move Events; (Up/Down) Select File; (,/.) Set Marker A/B; (</>) Goto Marker A/B; (Space) Pause; (b) Set Breakpoint");
+
+        let playback_inner = playback_block.inner(area);
+
+        let layout = Layout::new(
+            Direction::Vertical,
+            [
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ],
+        );
+        let playback_inner_splits = layout.split(playback_inner);
+
+        let prog_bar_layout = Layout::new(
+            Direction::Horizontal,
+            [Constraint::Length(50), Constraint::Fill(1)],
+        );
+
+        let prog_bar_splits = prog_bar_layout.split(playback_inner_splits[0]);
+        let time_bar_splits = prog_bar_layout.split(playback_inner_splits[1]);
+
+        let progress_len = prog_bar_splits[1].width as usize;
+        let progress = self.cur_event as f32 / self.num_events as f32;
+        let progress_style = Style::default().fg(Color::LightRed).bg(Color::Red);
+        let mut progress_data = vec![
+            SparklineBar::from(Some(0)).style(progress_style);
+            (progress * progress_len as f32) as usize
+        ];
+        if let Some(last) = progress_data.last_mut() {
+            *last = SparklineBar::from(Some(1)).style(progress_style);
+        }
+
+        if let Some(a) = self.marker_a {
+            let pos = a * (progress_len - 1) / self.num_events;
+            if progress_data.get(pos).is_some() {
+                progress_data[pos] =
+                    progress_data[pos].style(Style::default().fg(Color::DarkGray).bg(Color::Black));
+            }
+        }
+
+        if let Some(b) = self.marker_b {
+            let pos = b * (progress_len - 1) / self.num_events;
+            if progress_data.get(pos).is_some() {
+                progress_data[pos] =
+                    progress_data[pos].style(Style::default().fg(Color::White).bg(Color::Gray));
+            }
+        }
+
+        let progress_bar = Sparkline::default()
+            .data(progress_data)
+            .style(progress_style)
+            .max(1)
+            .absent_value_style(Style::default().bg(Color::Black));
+
+        let time_progress_style = Style::default().fg(Color::LightMagenta).bg(Color::Magenta);
+        let time_progress_len = time_bar_splits[1].width as usize;
+        let time_progress = self.cur_time.as_secs_f32() / self.end_time.as_secs_f32();
+        let mut time_progress_data =
+            vec![SparklineBar::from(Some(0)); (time_progress * time_progress_len as f32) as usize];
+
+        if let Some(last) = time_progress_data.last_mut() {
+            *last = SparklineBar::from(Some(1)).style(time_progress_style);
+        }
+        let time_progress_bar = Sparkline::default()
+            .data(time_progress_data)
+            .max(1)
+            .style(time_progress_style)
+            .absent_value_style(Style::default().bg(Color::Black));
+
+        let time_bar_text = Paragraph::new(format!(" time: {} / {}", cur_time, end_time));
+        let prog_bar_text = Paragraph::new(format!(
+            "event: {:18} / {:18}",
+            self.cur_event, self.num_events
+        ));
+
+        let log = Paragraph::new(self.current.as_str());
+
+        playback_block.render(area, buf);
+        progress_bar.render(prog_bar_splits[1], buf);
+        prog_bar_text.render(prog_bar_splits[0], buf);
+        time_progress_bar.render(time_bar_splits[1], buf);
+        time_bar_text.render(time_bar_splits[0], buf);
+        log.render(playback_inner_splits[2], buf);
     }
 }

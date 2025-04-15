@@ -14,9 +14,7 @@ use ratatui::{
 /// Application.
 #[derive(Debug)]
 pub struct App {
-    pub paused: bool,
     pub running: bool,
-    pub looping: bool,
     pub events: EventHandler,
     pub ui: Ui,
     pub data: FaultData,
@@ -27,9 +25,7 @@ impl App {
     /// Constructs a new instance of [`App`].
     pub fn new(cli: PlayCli, data: FaultData) -> Self {
         Self {
-            looping: true,
             running: true,
-            paused: true,
             events: EventHandler::new(),
             ui: Ui::new(&cli, &data),
             data,
@@ -57,13 +53,39 @@ impl App {
             Event::App(app_event) => match app_event {
                 AppEvent::Increment => self.increment_counter(1),
                 AppEvent::Decrement => self.decrement_counter(),
-                AppEvent::TogglePause => self.set_pause(!self.paused),
+                AppEvent::TogglePause => self.set_pause(!self.ui.status.paused),
                 AppEvent::Quit => self.quit(),
                 AppEvent::MoveUp => self.ui.fault_vis.move_highlight(true),
                 AppEvent::MoveDown => self.ui.fault_vis.move_highlight(false),
                 AppEvent::Char(c) => match c {
                     'b' => self.ui.fault_vis.toggle_break(),
-                    'l' => self.looping = !self.looping,
+                    'l' => self.ui.status.looping = !self.ui.status.looping,
+                    '<' => self.goto_event(self.get_first_play_event()),
+                    '>' => self.goto_event(self.get_last_play_event()),
+                    ',' => {
+                        if self
+                            .ui
+                            .status
+                            .marker_a
+                            .is_some_and(|a| a == self.ui.status.cur_event)
+                        {
+                            self.ui.status.marker_a = None;
+                        } else {
+                            self.ui.status.marker_a = Some(self.ui.status.cur_event);
+                        }
+                    }
+                    '.' => {
+                        if self
+                            .ui
+                            .status
+                            .marker_b
+                            .is_some_and(|b| b == self.ui.status.cur_event)
+                        {
+                            self.ui.status.marker_b = None;
+                        } else {
+                            self.ui.status.marker_b = Some(self.ui.status.cur_event);
+                        }
+                    }
                     _ => {}
                 },
             },
@@ -85,6 +107,8 @@ impl App {
             KeyCode::Down => self.events.send(AppEvent::MoveDown),
             KeyCode::Char('b') => self.events.send(AppEvent::Char('b')),
             KeyCode::Char('l') => self.events.send(AppEvent::Char('l')),
+            KeyCode::Char(',') => self.events.send(AppEvent::Char(',')),
+            KeyCode::Char('.') => self.events.send(AppEvent::Char('.')),
             KeyCode::Char(' ') => self.events.send(AppEvent::TogglePause),
             // Other handlers you could add here.
             _ => {}
@@ -97,12 +121,13 @@ impl App {
     /// The tick event is where you can update the state of your application with any logic that
     /// needs to be updated at a fixed frame rate. E.g. polling a server, updating an animation.
     pub fn tick(&mut self) {
-        if self.paused {
+        if self.ui.status.paused {
             return;
         }
-        if self.looping {
-            if self.ui.status.cur_event >= self.ui.status.num_events {
+        if self.ui.status.looping {
+            if self.ui.status.cur_event >= self.get_last_play_event() {
                 self.ui.reset();
+                self.goto_event(self.get_first_play_event());
             }
         }
         match self.cli.play_mode {
@@ -115,7 +140,7 @@ impl App {
                         break;
                     }
                     self.increment_counter(count);
-                    if self.ui.status.cur_event >= self.ui.status.num_events {
+                    if self.ui.status.cur_event >= self.get_last_play_event() {
                         break;
                     }
                 }
@@ -128,7 +153,7 @@ impl App {
                     if i as f32 > self.cli.play_speed {
                         break;
                     }
-                    if self.ui.status.cur_event >= self.ui.status.num_events {
+                    if self.ui.status.cur_event >= self.get_last_play_event() {
                         break;
                     }
                 }
@@ -150,12 +175,29 @@ impl App {
                         break;
                     }
                     self.increment_counter(count);
-                    if self.ui.status.cur_event >= self.ui.status.num_events {
+                    if self.ui.status.cur_event >= self.get_last_play_event() {
                         break;
                     }
                 }
             }
         }
+    }
+
+    pub fn goto_event(&mut self, event: usize) {
+        self.ui.status.cur_event = event;
+        self.increment_counter(1);
+    }
+
+    pub fn get_last_play_event(&self) -> usize {
+        if let Some(b) = self.ui.status.marker_b {
+            b.min(self.ui.status.num_events)
+        } else {
+            self.ui.status.num_events
+        }
+    }
+
+    pub fn get_first_play_event(&self) -> usize {
+        self.ui.status.marker_a.unwrap_or(0)
     }
 
     /// Set running to false to quit the application.
@@ -164,7 +206,7 @@ impl App {
     }
 
     pub fn next_event_time(&self) -> Option<Duration> {
-        if self.ui.status.cur_event >= self.ui.status.num_events {
+        if self.ui.status.cur_event >= self.get_last_play_event() {
             return None;
         }
         let fault = &self.data.records.slice()[self.ui.status.cur_event];
@@ -172,10 +214,11 @@ impl App {
     }
 
     pub fn count_events_before(&self, time: Duration) -> usize {
-        if self.ui.status.cur_event >= self.ui.status.num_events {
+        if self.ui.status.cur_event >= self.get_last_play_event() {
             return 0;
         }
-        let faults = &self.data.records.slice()[self.ui.status.cur_event..];
+        let faults =
+            &self.data.records.slice()[self.ui.status.cur_event..self.get_last_play_event()];
         faults
             .iter()
             .position(|f| f.time() > time)
@@ -183,11 +226,12 @@ impl App {
     }
 
     pub fn increment_counter(&mut self, count: usize) {
-        if self.ui.status.cur_event >= self.ui.status.num_events {
+        if self.ui.status.cur_event >= self.get_last_play_event() {
             return;
         }
 
-        let faults = &self.data.records.slice()[self.ui.status.cur_event..];
+        let faults =
+            &self.data.records.slice()[self.ui.status.cur_event..self.get_last_play_event()];
         let count = count.min(faults.len());
         let faults = &faults[0..count];
         if faults.len() == 0 {
@@ -205,8 +249,10 @@ impl App {
             res.hit_breakpoint,
         );
         self.ui.status.cur_time = faults[res.count - 1].time();
-        if self.ui.status.cur_event < self.ui.status.num_events {
-            self.ui.status.cur_event += res.count;
+        if self.ui.status.cur_event < self.get_last_play_event() {
+            self.ui.status.cur_event = self
+                .get_last_play_event()
+                .min(self.ui.status.cur_event + res.count);
         }
 
         if res.hit_breakpoint {
@@ -216,6 +262,6 @@ impl App {
 
     pub fn decrement_counter(&mut self) {}
     pub fn set_pause(&mut self, pause: bool) {
-        self.paused = pause;
+        self.ui.status.paused = pause;
     }
 }
