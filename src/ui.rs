@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, path::Path, time::Duration};
 
 use ratatui::{
     buffer::Buffer,
@@ -117,7 +117,11 @@ impl FileVis {
             faults: 0,
             faultdata: data.clone(),
             cachedata: data,
-            name,
+            name: Path::new(&name)
+                .file_name()
+                .map(|f| f.to_str().unwrap_or(name.as_str()))
+                .unwrap_or(name.as_str())
+                .to_string(),
             start_off,
             end_off,
             bar_size,
