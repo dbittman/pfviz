@@ -2,6 +2,8 @@
 
 Visualize page faults and cache misses to memory-mapped files during a running program.
 
+*This is still early, in-progress work. If you'd like to help out, please do so! PRs welcome!*
+
 ## Basic Usage
 
 This program has two basic modes, trace and play. In trace mode, the program will run another program and use perf to trace it, capturing page faults and additional events. The user can specify any number of extra events to capture with the -e flag. For example, on machines with this particular perf event, cache misses can be traced like this:
