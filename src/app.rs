@@ -57,6 +57,12 @@ impl App {
                 AppEvent::Quit => self.quit(),
                 AppEvent::MoveUp => self.ui.fault_vis.move_highlight(true),
                 AppEvent::MoveDown => self.ui.fault_vis.move_highlight(false),
+                AppEvent::Enter => self.ui.fault_vis.select(),
+                AppEvent::Esc => {
+                    if !self.ui.fault_vis.deselect() {
+                        self.quit();
+                    }
+                }
                 AppEvent::Char(c) => match c {
                     'b' => self.ui.fault_vis.toggle_break(),
                     'l' => self.ui.status.looping = !self.ui.status.looping,
@@ -96,7 +102,7 @@ impl App {
     /// Handles the key events and updates the state of [`App`].
     pub fn handle_key_event(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
         match key_event.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.events.send(AppEvent::Quit),
+            KeyCode::Char('q') => self.events.send(AppEvent::Quit),
             KeyCode::Char('c' | 'C') if key_event.modifiers == KeyModifiers::CONTROL => {
                 self.events.send(AppEvent::Quit)
             }
@@ -105,6 +111,8 @@ impl App {
 
             KeyCode::Up => self.events.send(AppEvent::MoveUp),
             KeyCode::Down => self.events.send(AppEvent::MoveDown),
+            KeyCode::Esc => self.events.send(AppEvent::Esc),
+            KeyCode::Enter => self.events.send(AppEvent::Enter),
             KeyCode::Char('b') => self.events.send(AppEvent::Char('b')),
             KeyCode::Char('l') => self.events.send(AppEvent::Char('l')),
             KeyCode::Char(',') => self.events.send(AppEvent::Char(',')),

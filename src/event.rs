@@ -42,6 +42,8 @@ pub enum AppEvent {
     TogglePause,
     MoveUp,
     MoveDown,
+    Enter,
+    Esc,
     Char(char),
 }
 

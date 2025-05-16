@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 pub mod app;
 pub mod event;
 pub mod perf;
+pub mod single_file_ui;
 pub mod trace;
 pub mod ui;
 

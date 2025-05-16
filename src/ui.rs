@@ -1,4 +1,9 @@
-use std::{collections::HashMap, path::Path, time::Duration};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use ratatui::{
     buffer::Buffer,
@@ -11,6 +16,7 @@ use crate::{
     PlayCli,
     app::App,
     perf::{EventKind, EventRecord, FaultData, PAGE_SIZE},
+    single_file_ui::SingleFileVis,
 };
 
 #[derive(Debug)]
@@ -81,14 +87,15 @@ impl RegionInfo {
 pub struct FileVis {
     faultdata: Vec<RegionInfo>,
     cachedata: Vec<RegionInfo>,
-    name: String,
-    start_off: u64,
-    end_off: u64,
+    pub name: String,
+    pub start_off: u64,
+    pub end_off: u64,
     bar_size: u64,
     faults: usize,
     misses: usize,
     is_highlighted: bool,
     breakpoint: bool,
+    pub objid: usize,
 }
 
 impl Into<SparklineBar> for &RegionInfo {
@@ -103,11 +110,11 @@ pub struct FaultProcessResult {
     pub count: usize,
 }
 
-const CACHE_SET: u64 = 10000;
-const CACHE_MAX: u64 = 9000;
+pub const CACHE_SET: u64 = 10000;
+pub const CACHE_MAX: u64 = 9000;
 
 impl FileVis {
-    pub fn new(name: String, start_off: u64, end_off: u64, bar_size: u64) -> Self {
+    pub fn new(name: String, start_off: u64, end_off: u64, bar_size: u64, objid: usize) -> Self {
         let len = ((1 + end_off - start_off) / bar_size) - 1;
         let data = vec![
             RegionInfo::new(0, Duration::ZERO, Style::default().bg(Color::DarkGray));
@@ -128,6 +135,7 @@ impl FileVis {
             misses: 0,
             is_highlighted: false,
             breakpoint: false,
+            objid,
         }
     }
 
@@ -279,6 +287,7 @@ impl Widget for &FileVis {
 #[derive(Debug)]
 pub struct FaultVis {
     file_vis: Vec<FileVis>,
+    single_file: Option<SingleFileVis>,
     width: u16,
     highlighted: Option<usize>,
 }
@@ -305,10 +314,11 @@ impl FaultVis {
                 name = "...".to_string() + &name[cut..name.len()];
             }
             map.insert(object.idx, file_vis.len());
-            file_vis.push(FileVis::new(name, start, end, bar_size));
+            file_vis.push(FileVis::new(name, start, end, bar_size, object.idx));
         }
         Self {
             file_vis,
+            single_file: None,
             width: cli.width as u16,
             highlighted: None,
         }
@@ -317,6 +327,9 @@ impl FaultVis {
     pub fn reset(&mut self) {
         for fv in &mut self.file_vis {
             fv.reset();
+        }
+        if let Some(sf) = self.single_file.as_mut() {
+            sf.reset();
         }
     }
 
@@ -332,6 +345,11 @@ impl FaultVis {
                 continue;
             };
             let res = self.file_vis[*idx].fault(&[*fault], data);
+            if let Some(single_file) = self.single_file.as_mut() {
+                if single_file.obj_id() == fault.obj_id() {
+                    single_file.fault(&[*fault], data);
+                }
+            }
             if res.hit_breakpoint {
                 return FaultProcessResult {
                     hit_breakpoint: true,
@@ -339,6 +357,10 @@ impl FaultVis {
                 };
             }
             count += res.count;
+        }
+
+        if let Some(single_file) = self.single_file.as_mut() {
+            single_file.calculate_decay(faults.last().unwrap().time());
         }
 
         FaultProcessResult {
@@ -372,6 +394,19 @@ impl FaultVis {
         self.highlighted = Some(value);
         self.file_vis[value].is_highlighted = true;
     }
+
+    pub fn select(&mut self) {
+        if self.single_file.is_some() {
+            return;
+        }
+        if let Some(selected) = self.highlighted {
+            self.single_file = Some(SingleFileVis::new(&self.file_vis[selected]));
+        }
+    }
+
+    pub fn deselect(&mut self) -> bool {
+        self.single_file.take().is_some()
+    }
 }
 
 impl Widget for &FaultVis {
@@ -379,6 +414,10 @@ impl Widget for &FaultVis {
     where
         Self: Sized,
     {
+        if let Some(single_file) = self.single_file.as_ref() {
+            single_file.render(area, buf);
+            return;
+        }
         const MAX_H: usize = 32;
         const MAX_V: usize = 32;
         let hcount: usize = usize::try_from(area.as_size().width / (self.width + 4))
