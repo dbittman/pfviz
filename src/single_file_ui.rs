@@ -27,7 +27,7 @@ impl SingleFileVis {
             let len = fv.end_off / 8;
             for _ in 0..8 {
                 let name = format!("{} ({} - {})", fv.name, start, start + len);
-                components.push(FileComponent::new(name, ps, start, len));
+                components.push(FileComponent::new(name, ps, start, len, fv.objid));
                 start += len;
             }
         }
@@ -108,7 +108,7 @@ impl Widget for &FileComponent {
         );
         let splits = inner_layout.split(inner);
 
-        let fault_sparkline = Sparkline::default().max(1).data(&self.faultdata);
+        let fault_sparkline = Sparkline::default().max(CACHE_MAX).data(&self.faultdata);
         let cache_sparkline = Sparkline::default().max(CACHE_MAX).data(&self.cachedata);
         block.render(area, buf);
         cache_sparkline.render(splits[0], buf);
@@ -126,12 +126,14 @@ pub struct FileComponent {
     misses: usize,
     start: u64,
     len: u64,
+    objid: usize,
 }
 
 impl FileComponent {
-    pub fn new(name: String, page_size: u64, start: u64, len: u64) -> Self {
+    pub fn new(name: String, page_size: u64, start: u64, len: u64, objid: usize) -> Self {
         Self {
             name,
+            objid,
             page_size,
             faultdata: Vec::new(),
             cachedata: Vec::new(),
@@ -159,7 +161,9 @@ impl FileComponent {
             let diff = decay_max - (time - page.time).min(decay_max);
 
             let micros = diff.as_micros() as u64;
-            page.value = Some(micros / 100);
+            if page.value.is_some() {
+                page.value = Some(micros / 100);
+            }
             if let Some(v) = page.value {
                 if v > 0 {
                     //      page.value = Some(v - 100);
@@ -171,14 +175,16 @@ impl FileComponent {
                 continue;
             }
 
-            let decay_max = Duration::from_millis(10);
+            let decay_max = Duration::from_millis(1000);
             let diff = decay_max - (time - page.time).min(decay_max);
 
-            let micros = diff.subsec_micros() as u64;
-            //page.value = Some(micros);
+            let micros = diff.as_micros() as u64;
+            if page.value.is_some() {
+                page.value = Some(micros / 100);
+            }
             if let Some(v) = page.value {
                 if v > 0 {
-                    page.value = Some(v - 1);
+                    //page.value = Some(v - 1);
                 }
             }
         }
@@ -186,6 +192,9 @@ impl FileComponent {
 
     pub fn fault(&mut self, faults: &[EventRecord], _fd: &FaultData) -> FaultProcessResult {
         for (idx, fault) in faults.iter().enumerate() {
+            if fault.obj_id() != self.objid {
+                continue;
+            }
             if fault.offset() >= self.start + self.len || fault.offset() < self.start {
                 continue;
             }
@@ -236,8 +245,11 @@ impl FileComponent {
 
             region_vec[pos as usize] =
                 PageInfo::new(fault, Style::default().fg(colors.0).bg(colors.1));
-            region_vec[pos as usize].value =
-                Some(if fault.kind().is_miss() { CACHE_SET } else { 1 });
+            region_vec[pos as usize].value = Some(if fault.kind().is_miss() {
+                CACHE_SET
+            } else {
+                CACHE_SET
+            });
         }
         FaultProcessResult {
             count: faults.len(),

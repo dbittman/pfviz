@@ -1,7 +1,8 @@
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use crate::app::App;
 use clap::{Parser, Subcommand};
+use perf::EventKind;
 
 pub mod app;
 pub mod event;
@@ -72,6 +73,10 @@ pub struct InfoCli {
         help = "Path of trace file to use (default pfviz.dat)"
     )]
     data_file: Option<PathBuf>,
+    #[arg(long, short, help = "List all events")]
+    list: bool,
+    #[arg(long, short, help = "Show stats for each object")]
+    stats: bool,
 }
 
 #[derive(Parser, Clone, Debug)]
@@ -135,7 +140,7 @@ fn main() -> color_eyre::Result<()> {
             let data = perf::FaultData::open(&datafile, &jsonfile)?;
 
             println!(
-                "{} ({}): {} objects, {} faults",
+                "{} ({}): {} objects, {} events",
                 jsonfile.display(),
                 datafile.display(),
                 data.json.objects.len(),
@@ -143,15 +148,41 @@ fn main() -> color_eyre::Result<()> {
             );
             println!("objects:");
             let mut v = vec![];
+            let mut event_map = HashMap::new();
             for obj in &data.json.objects {
                 let name = data.json.strings.resolve(obj.1.file).unwrap_or("[unknown]");
                 v.push((obj, name));
+                if info_cli.stats {
+                    let events = data.records.slice().iter().filter(|r| r.obj_id() == *obj.0);
+                    event_map.insert(*obj.0, events.collect::<Vec<_>>());
+                }
             }
 
             v.sort_by(|a, b| a.0.1.faults.cmp(&b.0.1.faults));
 
             for obj in v {
                 println!("{:4}: {} {}", obj.0.0, obj.0.1.faults, obj.1);
+                if info_cli.stats {
+                    let events = event_map.get(obj.0.0).unwrap();
+                    let misses = events.iter().filter(|e| e.kind().is_miss()).count();
+                    let faults = events.iter().filter(|e| e.kind().is_fault()).count();
+                    println!("      {} misses, {} faults", misses, faults);
+                }
+            }
+
+            if info_cli.list {
+                for event in data.records.slice() {
+                    println!(
+                        "{:?}: {:?} at {:x}: {}",
+                        event.time(),
+                        event.kind(),
+                        event.offset(),
+                        data.json
+                            .strings
+                            .resolve(data.json.objects[&event.obj_id()].file)
+                            .unwrap()
+                    );
+                }
             }
 
             Ok(())
