@@ -66,6 +66,14 @@ impl App {
                 AppEvent::Char(c) => match c {
                     'b' => self.ui.fault_vis.toggle_break(),
                     'l' => self.ui.status.looping = !self.ui.status.looping,
+                    'r' => self.cli.play_speed += 1.0,
+                    'a' => {
+                        if self.cli.play_speed > 1.0 {
+                            self.cli.play_speed -= 1.0
+                        }
+                    }
+                    'R' => self.cli.play_speed *= 2.0,
+                    'A' => self.cli.play_speed /= 2.0,
                     '<' => self.goto_event(self.get_first_play_event()),
                     '>' => self.goto_event(self.get_last_play_event()),
                     ',' => {
@@ -115,6 +123,10 @@ impl App {
             KeyCode::Enter => self.events.send(AppEvent::Enter),
             KeyCode::Char('b') => self.events.send(AppEvent::Char('b')),
             KeyCode::Char('l') => self.events.send(AppEvent::Char('l')),
+            KeyCode::Char('A') => self.events.send(AppEvent::Char('A')),
+            KeyCode::Char('a') => self.events.send(AppEvent::Char('a')),
+            KeyCode::Char('R') => self.events.send(AppEvent::Char('R')),
+            KeyCode::Char('r') => self.events.send(AppEvent::Char('r')),
             KeyCode::Char(',') => self.events.send(AppEvent::Char(',')),
             KeyCode::Char('.') => self.events.send(AppEvent::Char('.')),
             KeyCode::Char(' ') => self.events.send(AppEvent::TogglePause),
